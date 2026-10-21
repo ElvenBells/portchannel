@@ -1,0 +1,2911 @@
+diff --git a/cli/config_parser.ml b/cli/config_parser.ml
+index 3135ede58d..4cc6204e2b 100644
+--- a/cli/config_parser.ml
++++ b/cli/config_parser.ml
+@@ -2590,6 +2590,8 @@ let bfd_settings_to_command key value =
+         (match value with
+         | "1" -> ""
+         |  _ -> "  lacp port-priority " ^ value)
++      | "portchannel created" ->
++        ""
+       | "lacp channel_group" ->
+         (match value with
+         | "none" -> ""
+diff --git a/cli/global_commands/no_interface b/cli/global_commands/no_interface
+index ff58b3b6f8..04de75823d 100644
+--- a/cli/global_commands/no_interface
++++ b/cli/global_commands/no_interface
+@@ -1,2 +1,3 @@
+ loopback;Reset loopback interface configuration;interface_loopback
+ vlan;Reset vlan interface configuration;interface_vlan
++portchannel;Portchannel number;interface_portchannel
+diff --git a/cli/global_parser.mly b/cli/global_parser.mly
+index ce28454a9a..9eac6325d5 100644
+--- a/cli/global_parser.mly
++++ b/cli/global_parser.mly
+@@ -897,6 +897,7 @@ acl_opt:
+ | INTERFACE VLAN vid                     { "(interface vlan " ^ $3 ^ ")" }
+ | INTERFACE LOOPBACK number              { "(interface loopback " ^ $3 ^ ")" }
+ | INTERFACE TUNNEL num_1_32              { "(interface tunnel " ^ $3 ^ ")" }
++| INTERFACE PORTCHANNEL_ID               { "(interface " ^ $2 ^ ")" }
+ | IP no_ip_param                         { "(ip " ^ $2 ^ ")" }
+ | IPV6 no_ipv6_param                     { "(ipv6 " ^ $2 ^ ")" }
+ | IP ACCESSLIST word                     { "(ip access-list " ^ "\"" ^ $3 ^ "\"" ^ " )" }
+diff --git a/cli/print_message.ml b/cli/print_message.ml
+index 4a58a5f05d..eff8f3ac91 100644
+--- a/cli/print_message.ml
++++ b/cli/print_message.ml
+@@ -203,6 +203,12 @@ struct
+           "Command temporarily is not supported for portchannel"
+       | "portchannel_not_found"->
+           "Portchannel not found"
++      | "portchannel_inherited_setting" ->
++          "Setting is inherited from portchannel, configure it on the portchannel interface"
++      | "portchannel_internal_error" ->
++          "Portchannel manager internal error"
++      | "cfm_not_supported_on_portchannel" ->
++          "CFM is not supported for portchannel"
+       | "lacp_many_ports_in_group" ->
+           "LACP too many ports in group"
+       | "dhcp_host_not_found" ->
+diff --git a/manager/src/Makefile.in b/manager/src/Makefile.in
+index ffbed892b2..019c94e90c 100644
+--- a/manager/src/Makefile.in
++++ b/manager/src/Makefile.in
+@@ -203,6 +203,13 @@ ALL_TARGETS := \
+ 	$(EBIN_DIR)/config_igmp_proxy.beam \
+ 	$(EBIN_DIR)/config_l2tp.beam \
+ 	$(EBIN_DIR)/config_lacp.beam \
++	$(EBIN_DIR)/config_portchannel.beam \
++	$(EBIN_DIR)/portchannel_eh.beam \
++	$(EBIN_DIR)/portchannel_hw.beam \
++	$(EBIN_DIR)/portchannel_mgr.beam \
++	$(EBIN_DIR)/portchannel_planner.beam \
++	$(EBIN_DIR)/portchannel_registry.beam \
++	$(EBIN_DIR)/validator_portchannel.beam \
+ 	$(EBIN_DIR)/config_lbd.beam \
+ 	$(EBIN_DIR)/config_logging.beam \
+ 	$(EBIN_DIR)/config_lo.beam \
+@@ -361,6 +368,8 @@ ALL_TARGETS := \
+ 	$(EBIN_DIR)/snmpa_map.beam \
+ 	$(EBIN_DIR)/snmpa_notifier.beam \
+ 	$(EBIN_DIR)/snmpa_tests.beam \
++	$(EBIN_DIR)/portchannel_planner_tests.beam \
++	$(EBIN_DIR)/portchannel_registry_tests.beam \
+ 	$(EBIN_DIR)/snmpaman.beam \
+ 	$(EBIN_DIR)/snmpaman_eh.beam \
+ 	$(EBIN_DIR)/stack.beam \
+diff --git a/manager/src/common.hrl b/manager/src/common.hrl
+index b31764ff59..427fbfcb6f 100644
+--- a/manager/src/common.hrl
++++ b/manager/src/common.hrl
+@@ -2315,6 +2315,10 @@
+ -define (LACP_PORT_CHANNEL_GROUP_DEF, none).
+ -define (LACP_PORT_CHANNEL_GROUP_MIN, 1).
+ -define (LACP_PORT_CHANNEL_GROUP_MAX, 64).
++-define (LACP_PORT_CHANNEL_MAX_MEMBERS, 8).
++
++-define (PORTCHANNEL_KEY (N), {portchannel, {portchannel, N}, created}).
++-define (PORTCHANNEL_DEF, undefined).
+ 
+ -define (LACP_PORT_PRIORITY_KEY(If), ?LACP_PORT_KEY(If, port_priority)).
+ -define (LACP_PORT_PRIORITY_DEF, 1).
+diff --git a/manager/src/config_defaults.erl b/manager/src/config_defaults.erl
+index 396f71aeb6..36970b802b 100644
+--- a/manager/src/config_defaults.erl
++++ b/manager/src/config_defaults.erl
+@@ -570,6 +570,7 @@ i (?IP_SOURCE_GUARD_STATIC_BINDING_DKEY(_, _, _)) -> [{subs, ip_source_guard}];
+ i (?LACP_SYSTEM_PRIORITY_KEY)       -> [{subs, lacp}, {def, ?LACP_SYSTEM_PRIORITY_DEF}];
+ 
+ i (?LACP_PORT_CHANNEL_GROUP_KEY(_)) -> [{subs, lacp}, {def, ?LACP_PORT_CHANNEL_GROUP_DEF}];
++i (?PORTCHANNEL_KEY(_))             -> [{subs, portchannel}, {def, ?PORTCHANNEL_DEF}];
+ i (?LACP_PORT_PRIORITY_KEY(_))      -> [{subs, lacp}, {def, ?LACP_PORT_PRIORITY_DEF}];
+ i (?LACP_PORT_TIMEOUT_KEY(_))       -> [{subs, lacp}, {def, ?LACP_PORT_TIMEOUT_DEF}];
+ 
+diff --git a/manager/src/config_lacp.erl b/manager/src/config_lacp.erl
+index 1472ace86f..93b1f26d4d 100644
+--- a/manager/src/config_lacp.erl
++++ b/manager/src/config_lacp.erl
+@@ -30,18 +30,26 @@ handle_set (?LACP_SYSTEM_PRIORITY_KEY, Value) ->
+   validator_utils:config_if_master (F);
+ 
+ handle_set (Key = ?LACP_PORT_CHANNEL_GROUP_KEY (If), Value = {G, M}) ->
+-  move_portchannel_services_to_if(If, {G, M}),
+   F =
+     fun () ->
+       trunk_conf:set_port_conf (If, [{channel_group, {G, M}}])
+     end,
+-  lacp_state:add_port(If),
+-  node:call(node:master(), stp_mgr, mst_set_trunk_ports, [If, G]),
+-  node:call(node:master(), stp_mgr, event, [{set, {Key, Value}}]),
+-  node:multicall (dhcp_snp, binding_del_on_vif, [ If ]),
+-  validator_utils:config_if_master (F),
+-  igmp_conf:sync_igmp_on_pc_member(If,G),
+-  monitor:sources_update_portchannel (G);
++  case portchannel_mgr:enabled () of
++    true ->
++      ?DBG("[LACP] >>> NEW PATH (manager enabled) <<<~n", []),
++      lacp_state:add_port(If),
++      validator_utils:config_if_master (F);
++    false ->
++      ?DBG("[LACP] !!! OLD PATH (manager disabled) !!!~n", []),
++      move_portchannel_services_to_if(If, {G, M}),
++      lacp_state:add_port(If),
++      master_call (stp_mgr, mst_set_trunk_ports, [If, G]),
++      master_call (stp_mgr, event, [{set, {Key, Value}}]),
++      master_multicall (dhcp_snp, binding_del_on_vif, [ If ]),
++      validator_utils:config_if_master (F),
++      igmp_conf:sync_igmp_on_pc_member(If,G),
++      monitor:sources_update_portchannel (G)
++  end;
+ 
+ handle_set (?LACP_PORT_PRIORITY_KEY (If), Value) ->
+   F = fun () -> trunk_conf:set_port_conf (If, [{port_priority, Value}]) end,
+@@ -65,17 +73,25 @@ handle_unset (?LACP_SYSTEM_PRIORITY_KEY) ->
+   validator_utils:config_if_master (F);
+ 
+ handle_unset (Key = ?LACP_PORT_CHANNEL_GROUP_KEY (If)) ->
+-  move_portchannel_services_from_if(If),
+   F =
+     fun () ->
+       trunk_conf:set_port_conf (If, [{channel_group, ?LACP_PORT_CHANNEL_GROUP_DEF}])
+     end,
+-  lacp_state:del_port(If),
+-  node:call(node:master(), stp_mgr, mst_set_trunk_ports, [If, none]),
+-  node:call(node:master(), stp_mgr, event, [{set, {Key, ?LACP_PORT_CHANNEL_GROUP_DEF}}]),
+-  validator_utils:config_if_master (F),
+-  {G, _} = dummy_conf:get (Key),
+-  monitor:sources_update_portchannel (G);
++  case portchannel_mgr:enabled () of
++    true ->
++      lacp_state:del_port(If),
++      validator_utils:config_if_master (F);
++    false ->
++      move_portchannel_services_from_if(If),
++      lacp_state:del_port(If),
++      master_call (stp_mgr, mst_set_trunk_ports, [If, none]),
++      master_call (stp_mgr, event, [{set, {Key, ?LACP_PORT_CHANNEL_GROUP_DEF}}]),
++      validator_utils:config_if_master (F),
++      case dummy_conf:get (Key) of
++        {G, _} -> monitor:sources_update_portchannel (G);
++        _      -> ok
++      end
++  end;
+ 
+ handle_unset (?LACP_PORT_PRIORITY_KEY (If)) ->
+   F =
+@@ -93,6 +109,18 @@ handle_unset (?LACP_PORT_TIMEOUT_KEY (If)) ->
+ 
+ handle_unset (_Key) -> ok.
+ 
++master_call (Mod, Fun, Args) ->
++  case node:this () == node:master () of
++    true  -> node:call (node:master (), Mod, Fun, Args);
++    false -> ok
++  end.
++
++master_multicall (Mod, Fun, Args) ->
++  case node:this () == node:master () of
++    true  -> node:multicall (Mod, Fun, Args);
++    false -> ok
++  end.
++
+ not_undefined (undefined) -> 0;
+ not_undefined (N) -> N.
+ 
+@@ -155,7 +183,7 @@ move_portchannel_services_to_if(If = {_, Dev, _}, {PC, _}) ->
+             {?PORTCHANNEL_SERVICE_POLICY_KEY(_), {Dest, Name}} ->
+               link_policy_to_iface (?PORT_SERVICE_POLICY_KEY (If), Dest, Name);
+             {?PORTCHANNEL_SERVICE_PBR_KEY(_), Name} ->
+-              link_pbr_to_iface (?PORT_SERVICE_POLICY_KEY (If), Name)
++              link_pbr_to_iface (?PORT_SERVICE_PBR_KEY (If), Name)
+           end
+         end || Service <- PortChannelServices ];
+     _ ->
+diff --git a/manager/src/config_port.erl b/manager/src/config_port.erl
+index 7405cc3f4e..18cbaf990d 100644
+--- a/manager/src/config_port.erl
++++ b/manager/src/config_port.erl
+@@ -243,6 +243,7 @@ handle_set(?PORT_MDIX_AUTO_KEY(If), Value) ->
+   validator_utils:config_if_current(If, Fun);
+ 
+ handle_set(?PORT_MODE_KEY(VIF) = Key, Value) ->
++  io:format("handle_set(?PORT_MODE_KEY(VIF) = Key ~p, Value ~p) ~n", [VIF, Value]),
+   Port = utils:if_to_index(VIF),
+   Fun =
+     case VIF of
+@@ -757,4 +758,4 @@ update_vif_shutdown(VIF, UpdatedValue) ->
+           swmgr:shutdown_vif (VIF, FinalValue)
+         end
+     end,
+-  validator_utils:config_if_current(VIF, Fun).
+\ No newline at end of file
++  validator_utils:config_if_current(VIF, Fun).
+diff --git a/manager/src/control.erl b/manager/src/control.erl
+index 2db4f61ca7..e02b9ecbad 100644
+--- a/manager/src/control.erl
++++ b/manager/src/control.erl
+@@ -269,6 +269,7 @@ admin_process (Req, Mode, Type) ->
+       [dhcpv6, network, {Name}] ->
+         dhcpv6_network_process (Req, Name);
+       [interface, IFlist] ->
++        io:format("interface adm proc ~p ~n", [true]),
+         StackId = sysinfo:get_stack_id(),
+         ProperIfList =
+           case IFlist of
+@@ -292,7 +293,7 @@ admin_process (Req, Mode, Type) ->
+             case validator_utils:check_vif_list (ProperIfList) of
+               true ->
+                 ?DBG("interface_process (~p, ~p)~n", [Req, ProperIfList]),
+-                interface_process (Req, ProperIfList);
++                interface_process_guarded (Req, ProperIfList);
+               _    -> {error, port_not_found}
+             end
+         end;
+@@ -1493,6 +1494,9 @@ global_process ([hostname, {Name}], _) ->
+ global_process ([vrf, VrfName], _) ->
+   dummy_conf:set(?VRF_CREATED_DKEY(VrfName), true);
+ 
++global_process ([interface, [portchannel, N]], _) ->
++  portchannel_mgr:create (N, manual);
++
+ global_process ([interface, loopback, ID], _) ->
+   dummy_conf:set(?LO_IF_CREATED_DKEY(ID), true);
+ 
+@@ -2089,6 +2093,9 @@ global_process ([no, vrf, VrfName], _) ->
+       end
+   end;
+ 
++global_process ([no, [interface, [portchannel, N]]], _) ->
++  portchannel_mgr:delete (N);
++
+ global_process ([no, [interface, vlan, VID]], _) ->
+   dummy_conf:match_unset(?IFACE_VLAN_KEY(VID, '_'));
+ 
+@@ -2980,6 +2987,12 @@ norm_proto(Proto, AS) ->
+ %% CFM Commands
+ %%----------------------------------------------------------------------
+ 
++cfm_process(_Req, [[portchannel, _N] | _]) ->
++  {error, cfm_not_supported_on_portchannel};
++
++cfm_process(_Req, [{portchannel, _N} | _]) ->
++  {error, cfm_not_supported_on_portchannel};
++
+ cfm_process([service, {MaName}, [vlan, VID], [direction, Direct]], [{Domain}, [level, Lvl]]) ->
+   dummy_conf:set(?CFM_SERVICE_VLAN_KEY (Domain), {Lvl, MaName, VID, Direct});
+ 
+@@ -3030,6 +3043,12 @@ cfm_process(Req, _Mode) ->
+   show(Req).
+ 
+ 
++no_cfm_process(_Req, [[portchannel, _N] | _]) ->
++  {error, cfm_not_supported_on_portchannel};
++
++no_cfm_process(_Req, [{portchannel, _N} | _]) ->
++  {error, cfm_not_supported_on_portchannel};
++
+ no_cfm_process([service, {_MaName}, [vlan, _VID], [direction, _Direct]], [{Domain}, _]) ->
+   dummy_conf:match_unset(?CFM_DOMAIN_KEY(Domain, '_'));
+ 
+@@ -3581,6 +3600,9 @@ interface_process ([ip, dhcp, snooping, Param], {portchannel, _N}) ->
+   % Param is [trust], [limit, rate, _PPS], [vlan, _VID, 'circuit-id', _CircParam]
+   {error, portchannel_temporarily_is_not_supported};
+ 
++interface_process ([ip, device, tracking, maximum, _Num], {portchannel, _N}) ->
++  {error, portchannel_is_not_supported};
++
+ interface_process ([ip, device, tracking, maximum, Num], IFList) ->
+   case utils:is_in_stack() of
+     false ->
+@@ -3739,6 +3761,12 @@ interface_process ([no, Req], {portchannel, N} = PC) ->
+       dummy_conf:set(?LOGGING_LINK_KEY(PC), false);
+     [logging, event, 'spanning-tree'] ->
+       dummy_conf:set(?STP_PORT_STATE_LOG_KEY(PC), false);
++    [queue, bandwidth, limit] ->
++      process_result_list ([ no_qos_traffic_shape (PC, nil) ]);
++    ['traffic-shape'] ->
++      process_result_list ([ no_qos_traffic_shape (PC, nil) ]);
++    ['traffic-shape', queue, Qid] ->
++      process_result_list ([ no_qos_traffic_shape (PC, {queue, Qid}) ]);
+     _ -> {error, portchannel_is_not_supported}
+   end;
+ 
+@@ -3793,6 +3821,30 @@ interface_process ([no, 'rate-limit'], {portchannel, _N}) ->
+ interface_process ([udld, port, _], {portchannel, _N}) ->
+   {error, portchannel_is_not_supported};
+ 
++interface_process ([udld, port], {portchannel, _N}) ->
++  {error, portchannel_is_not_supported};
++
++interface_process ([alarm, 'link-status'], {portchannel, _N}) ->
++  {error, portchannel_is_not_supported};
++
++interface_process ([alarm, 'link-status', relay], {portchannel, _N}) ->
++  {error, portchannel_is_not_supported};
++
++interface_process ([qcn, _Param], {portchannel, _N}) ->
++  {error, portchannel_is_not_supported};
++
++interface_process ([sflow, _Req], {portchannel, _N}) ->
++  {error, portchannel_is_not_supported};
++
++interface_process ([service, instance, _Id, ethernet, _MaNum], {portchannel, _N}) ->
++  {error, cfm_not_supported_on_portchannel};
++
++interface_process ([queue, bandwidth, limit, Bps], {portchannel, _N} = PC) ->
++  interface_process (['traffic-shape', Bps], PC);
++
++interface_process (['traffic-shape' | Req], {portchannel, _N} = PC) ->
++  process_result_list ([ qos_traffic_shape (PC, Req) ]);
++
+ interface_process ([alarm, 'link-status'], IFList) ->
+   dummy_conf:set ([{?PORT_ALARM_LINK_STATUS_KEY (IF), enable} || IF <- IFList]);
+ interface_process ([alarm, 'link-status', relay], IFList) ->
+@@ -4448,9 +4500,25 @@ interface_process ([no, Req], IFlist) ->
+         _ -> {error, unknown_command}
+     end;
+ 
++interface_process (_Req, {portchannel, _N}) ->
++    {error, portchannel_is_not_supported};
++
+ interface_process (_Req, _) ->
+     {error, unknown_command}.
+ 
++%% A command without a portchannel clause would iterate over the tuple
++%% {portchannel, N} and die with bad_generator; report it as unsupported.
++interface_process_guarded (Req, {portchannel, _N} = PC) ->
++    try
++        interface_process (Req, PC)
++    catch
++        error:{bad_generator, PC} ->
++            ?DBG ("interface_process: no portchannel clause for ~p~n", [Req]),
++            {error, portchannel_is_not_supported}
++    end;
++interface_process_guarded (Req, IFList) ->
++    interface_process (Req, IFList).
++
+ %%%------------------------------------------------------------------------------
+ %%% @doc Set ranges of bit values
+ %%% @end
+@@ -4951,7 +5019,10 @@ monitor_process (Req, Session) ->
+             Intfs = case lists:member(portchannel, List) of
+               true ->
+                   [T, N] = List,
+-                  [{port, {T, N}}]; % {portchannel, N}
++                  case portchannel_mgr:exists (N) of
++                    true  -> [{port, {T, N}}]; % {portchannel, N}
++                    false -> not_found
++                  end;
+               false ->
+                 lists:filtermap(
+                   fun([T, S0, N]) ->
+@@ -4971,6 +5042,7 @@ monitor_process (Req, Session) ->
+                 busy -> {error, monitor_configurations_conflict};
+                 _ ->
+                   case Intfs of
++                    not_found -> {error, portchannel_not_found};
+                     [] -> {error, invalid_source};
+                     _  ->
+                       [dummy_conf:set (?MONITOR_SOURCE_DKEY (Session, Port), Type) || Port <- Intfs],
+@@ -4999,14 +5071,10 @@ no_monitor_process (NoReq, Session) ->
+         [source, [interface, List]] ->
+             Ports = case lists:member(portchannel,List) of
+               true ->
+-                PcList = [PcId || {{portchannel, PcId}, _} <- utils:get_portchannels()],
++                %% a reference to a group that is already gone has to be
++                %% removable as well, otherwise it stays forever
+                 [T, PchId] = List,
+-                case lists:member(PchId, PcList) of
+-                      true ->
+-                        [{port, {T, PchId} }];
+-                      false ->
+-                        []
+-                end;
++                [{port, {T, PchId} }];
+               false ->
+                 lists:map(fun([T, S0, N]) ->
+                   S = case S0 of
+diff --git a/manager/src/dummy_conf.erl b/manager/src/dummy_conf.erl
+index 5670597337..47a79bcb61 100644
+--- a/manager/src/dummy_conf.erl
++++ b/manager/src/dummy_conf.erl
+@@ -67,6 +67,7 @@
+           to_option/2,
+           lock/0,
+           unlock/0,
++          reapply/1,
+           reset/0]).
+ 
+ %% For use only in validators!
+@@ -404,6 +405,17 @@ unlock() ->
+ reset() ->
+   call(reset).
+ 
++%%--------------------------------------------------------------------
++%% @doc Re-drives the configurators for the given keys with the value
++%%      they currently have. Neither the tables nor the events change:
++%%      used to bring the hardware back to the committed configuration.
++%% @end
++%%--------------------------------------------------------------------
++-spec reapply (Keys :: [key ()]) -> ok.
++
++reapply (Keys) when is_list (Keys) ->
++  call ({reapply, Keys}).
++
+ %% @private
+ conf_add_mode(List) ->
+   [{config_files:add_mode(Key), [KV]} || KV = {Key, _} <- List].
+@@ -531,6 +543,15 @@ handle_call ({transaction, Bundles}, _From, State) ->
+   Reply = do_transaction (Bundles),
+   {reply, Reply, State};
+ 
++handle_call ({reapply, Keys}, _From, State) ->
++  Opts = [ to_option (set, {Key, Value})
++           || Key <- Keys, {ok, Value} <- [dget (Key)] ],
++  case Opts of
++    [] -> ok;
++    _  -> catch node:multicall (?MODULE, do_just_apply, [Opts])
++  end,
++  {reply, ok, State};
++
+ handle_call ({match_unset, Pattern}, _From, State) ->
+   Reply = do_match_unset (Pattern),
+   {reply, Reply, State};
+@@ -793,7 +814,9 @@ get_subsystems() ->
+   x_map,
+   erps,
+   sflow,
+-  ptp
++  ptp,
++  %% must stay last: it drives the services that follow membership
++  portchannel
+  ].
+ 
+ -spec handle_options ([ Options :: #co{} ]) -> ok | {error, Reason :: atom ()}.
+@@ -815,26 +838,54 @@ handle_options (Bundle) ->
+           lists:foldl (ProcessSubSystem, ValidAcc, Subsystems)
+       end,
+     ValidOpts = lists:foldl (ValidateOpt, [], Bundle),
++    FinalOpts = plan_portchannel (ValidOpts),
+     {Results, _BadNodes} = node:multicall (?MODULE,
+                                            apply,
+-                                           [ ValidOpts ]),
++                                           [ FinalOpts ]),
+     handle_errors(Results)
+   catch
+     { { error, { Tag, Msg } }, _Opt } ->
+       node:multicall(?MODULE, tab_validated_from_applied, []),
++      portchannel_mgr:transaction_failed (Bundle),
+       { error, Tag, case is_atom(Msg) of
+                       true -> Msg;
+                       _ -> list_to_atom(Msg)
+                     end };
+     Error ->
+       node:multicall(?MODULE, tab_validated_from_applied, []),
+-      Error
++      portchannel_mgr:transaction_failed (Bundle),
++      Error;
++    Class:Reason ->
++      ?DBG ("handle_options: ~w: ~p~n~p~n",
++            [Class, Reason, erlang:get_stacktrace ()]),
++      node:multicall(?MODULE, tab_validated_from_applied, []),
++      portchannel_mgr:transaction_failed (Bundle),
++      { error, internal_error, internal_error }
+   end.
+ 
+ %%%=====================================================================
+ %%% Internal functions
+ %%%=====================================================================
+ 
++%% The PortChannel planner is the single point where a transaction is
++%% completed with everything the groups and their members need. It runs
++%% after the validators, before the options reach the nodes.
++plan_portchannel (ValidOpts) ->
++  case portchannel_mgr:enabled () of
++    false ->
++      ValidOpts;
++    true ->
++      LoadMode = portchannel_mgr:load_in_progress (),
++      case portchannel_planner:plan (ValidOpts, ?TAB_APPLIED, ?TAB_VALIDATED,
++                                     LoadMode) of
++        {ok, FinalOpts, Generated} ->
++          lists:foreach (fun ets_modify2/1, Generated),
++          FinalOpts;
++        {error, Error} ->
++          throw ({Error, portchannel})
++      end
++  end.
++
+ tab_validated_from_applied () ->
+   ets:delete_all_objects(?TAB_VALIDATED),
+   ets:insert(?TAB_VALIDATED, ets:tab2list(?TAB_APPLIED)).
+@@ -963,15 +1014,17 @@ notify (Event) ->
+ 
+ %% @private
+ handle_errors(Errors) ->
+-    case hd(Errors) of
+-        ok ->
++    NotOk = lists:dropwhile (fun (ok) -> true; (_) -> false end, Errors),
++    case NotOk of
++        [] ->
+             ok;
+-        Error ->
+-            {Module, ModuleError} = Error,
+-            {Opt, OptError} = ModuleError,
++        [{Module, {Opt, OptError}} | _] ->
+             ?DBG("\nSubsystem ~p is failed for option ~p with error ~p~n",
+                  [Module, Opt, OptError]),
+-            throw({OptError, Opt})
++            throw({OptError, Opt});
++        [Other | _] ->
++            ?DBG("\nSubsystem call failed: ~p~n", [Other]),
++            throw({internal_error, Other})
+     end.
+ 
+ %% @private
+diff --git a/manager/src/manager.app.in b/manager/src/manager.app.in
+index 65f9649f16..fc9bfaf000 100644
+--- a/manager/src/manager.app.in
++++ b/manager/src/manager.app.in
+@@ -136,6 +136,13 @@
+              config_global,
+              config_l2tp,
+              config_lacp,
++             config_portchannel,
++             portchannel_eh,
++             portchannel_hw,
++             portchannel_mgr,
++             portchannel_planner,
++             portchannel_registry,
++             validator_portchannel,
+              config_lbd,
+              config_logging,
+              config_lo,
+@@ -289,6 +296,8 @@
+              snmpa_map,
+              snmpa_notifier,
+              snmpa_tests,
++             portchannel_planner_tests,
++             portchannel_registry_tests,
+              snmpaman,
+              snmpaman_eh,
+              sntp_mgr,
+diff --git a/manager/src/manager_sup.erl b/manager/src/manager_sup.erl
+index 949d5d57ca..72b79d2d17 100644
+--- a/manager/src/manager_sup.erl
++++ b/manager/src/manager_sup.erl
+@@ -327,6 +327,12 @@ init([]) ->
+              2000,
+              worker,
+              [trunk_conf]},
++            {portchannel_mgr,
++             {portchannel_mgr, start_link, []},
++             permanent,
++             2000,
++             worker,
++             [portchannel_mgr]},
+             {vct,
+              {vct, start_link, []},
+              permanent,
+diff --git a/manager/src/monitor.erl b/manager/src/monitor.erl
+index 4ab0d15a48..507ea9f172 100644
+--- a/manager/src/monitor.erl
++++ b/manager/src/monitor.erl
+@@ -77,7 +77,7 @@ sources_update_portchannel (IDch) when ?is_portchannel (IDch) ->
+   lists:foreach (
+     fun ([SessionId, Src]) ->
+       case Src of 
+-        {port, {4, PchId}} when PchId =:= IDch -> 
++        {port, {portchannel, PchId}} when PchId =:= IDch ->
+           sources_update (SessionId);
+         _ ->
+           ok
+diff --git a/manager/src/startup_config.erl b/manager/src/startup_config.erl
+index e019f9c71e..16a9b938f6 100644
+--- a/manager/src/startup_config.erl
++++ b/manager/src/startup_config.erl
+@@ -66,12 +66,14 @@ configure (FileName) ->
+             os:cmd ("touch " ++ control:get_env (manager_dir) ++ "/" ++ ?STARTUP_FLAG),
+             Commands = get_commands(FileName),
+             ?DBG ("configure~n", []),
++            portchannel_mgr:load_started (),
+             ok = dummy_conf:lock(),
+             lists:foreach (fun (X) ->
+                                    do_process (X, FileName)
+                            end,
+                            Commands),
+-            ok = dummy_conf:unlock();
++            ok = dummy_conf:unlock(),
++            portchannel_mgr:load_finished ();
+         true ->
+             ?DBG ("skip configure: not a master~n", [])
+     end,
+diff --git a/manager/src/trunk_conf.erl b/manager/src/trunk_conf.erl
+index 87bfbeaa01..63d152d8fc 100644
+--- a/manager/src/trunk_conf.erl
++++ b/manager/src/trunk_conf.erl
+@@ -453,7 +453,7 @@ t_add_port ({S, _, _} = P, T) ->
+           {ok, [{create, T1}, {enter, P, T1}], T1};
+         S ->
+           N = dict:size (Ps0),
+-          if N >= 8 ->
++          if N >= ?LACP_PORT_CHANNEL_MAX_MEMBERS ->
+               {error, no_free_space};
+              true ->
+               Ps1 = dict:store (P, false, Ps0),
+diff --git a/manager/src/utils.erl b/manager/src/utils.erl
+index c7b338559a..ef42278e1e 100644
+--- a/manager/src/utils.erl
++++ b/manager/src/utils.erl
+@@ -732,30 +732,48 @@ is_portchannel ({portchannel, N}) when is_integer(N)
+ is_portchannel(_) ->
+   false.
+ 
++%% The manager owns the notion of a group: it knows the empty ones as
++%% well and answers with the membership the running transaction leaves.
+ get_portchannels () ->
+-  PCKeys = dummy_conf:match_key (?LACP_PORT_CHANNEL_GROUP_KEY ('_')),
+-  F =
+-    fun ({?LACP_PORT_CHANNEL_GROUP_KEY (IF), {N, _M}}, Dict) ->
+-      dict:append ({portchannel, N}, IF, Dict)
+-    end,
+-  D = lists:foldl (F, dict:new (), PCKeys),
+-  lists:sort (dict:to_list (D)).
++  case portchannel_mgr:enabled () of
++    true ->
++      lists:sort ([ {{portchannel, N}, portchannel_mgr:members (N)}
++                    || N <- portchannel_mgr:portchannels () ]);
++    false ->
++      PCKeys = dummy_conf:match_key (?LACP_PORT_CHANNEL_GROUP_KEY ('_')),
++      F =
++        fun ({?LACP_PORT_CHANNEL_GROUP_KEY (IF), {N, _M}}, Dict) ->
++          dict:append ({portchannel, N}, IF, Dict)
++        end,
++      D = lists:foldl (F, dict:new (), PCKeys),
++      lists:sort (dict:to_list (D))
++  end.
+ 
+ get_pc_ifs ({portchannel, PC}) ->
+-  dummy_conf:select(
+-    ets:fun2ms(fun ({?LACP_PORT_CHANNEL_GROUP_KEY (If), {PC0, _}})
+-               when PC0 == PC ->
+-               If
+-               end));
++  case portchannel_mgr:enabled () of
++    true ->
++      portchannel_mgr:members (PC);
++    false ->
++      dummy_conf:select(
++        ets:fun2ms(fun ({?LACP_PORT_CHANNEL_GROUP_KEY (If), {PC0, _}})
++                   when PC0 == PC ->
++                   If
++                   end))
++  end;
+ get_pc_ifs (_) -> [].
+ 
+ get_pcs () ->
+-  PCKeys = dummy_conf:match_key (?LACP_PORT_CHANNEL_GROUP_KEY ('_')),
+-  F =
+-    fun ({?LACP_PORT_CHANNEL_GROUP_KEY (_), {N, _M}}, Acc) ->
+-      [{portchannel, N} | Acc]
+-    end,
+-  lists:usort (lists:foldl (F, [], PCKeys)).
++  case portchannel_mgr:enabled () of
++    true ->
++      [ {portchannel, N} || N <- portchannel_mgr:portchannels () ];
++    false ->
++      PCKeys = dummy_conf:match_key (?LACP_PORT_CHANNEL_GROUP_KEY ('_')),
++      F =
++        fun ({?LACP_PORT_CHANNEL_GROUP_KEY (_), {N, _M}}, Acc) ->
++          [{portchannel, N} | Acc]
++        end,
++      lists:usort (lists:foldl (F, [], PCKeys))
++  end.
+ 
+ is_port_in_vlan (P, V) ->
+     IdxToIf = fun utils:index_to_if/1,
+diff --git a/manager/src/validator.hrl b/manager/src/validator.hrl
+index 2c0dee274a..6981389a18 100644
+--- a/manager/src/validator.hrl
++++ b/manager/src/validator.hrl
+@@ -123,6 +123,9 @@
+ -define(EINVALIDOSPFAREA,      {error, {invalid_ospf_area, "Invalid Area ID"}}).
+ -define(EINVALIDOSPFPID,       {error, {invalid_ospf_pid, "Invalid Process ID"}}).
+ -define(EINVALIDPORTTYPE,      {error, {invalid_port_type, "Invalid port type"}}).
++-define(EPCINHERITED,          {error, {portchannel_inherited_setting, "Setting is inherited from portchannel"}}).
++-define(EPCNOTFOUND,           {error, {portchannel_not_found, "Portchannel not found"}}).
++-define(EPCINTERNAL,           {error, {portchannel_internal_error, "Portchannel manager internal error"}}).
+ -define(EINVALIDRADIUSHOST,    {error, {invalid_radius_host, "IP or domain name and options' list only allowed"}}).
+ -define(EINVALIDRADIUSHOSTOPT, {error, {invalid_radius_host_opt, "Key-value pairs only allowed"}}).
+ -define(EINVALIDRULE,          {error, {invalid_rule,  "Invalid rule"}}).
+@@ -285,6 +288,9 @@
+   ?ECONFPSLACP,
+   ?ECONFQOSLACP,
+   ?ECONFVOICEVLANLACP,
++  ?EPCINHERITED,
++  ?EPCNOTFOUND,
++  ?EPCINTERNAL,
+   ?EDOT1XENABLED,
+   ?EDOT1XENABLEDPORT,
+   ?EDOT1XMULTSSNS,
+diff --git a/manager/src/validator_lacp.erl b/manager/src/validator_lacp.erl
+index 8e1241e5af..0f97b751f2 100644
+--- a/manager/src/validator_lacp.erl
++++ b/manager/src/validator_lacp.erl
+@@ -68,6 +68,7 @@ validate_key (#co { key = ?LACP_PORT_CHANNEL_GROUP_KEY (If),
+                     action = set,
+                     value = { G, M } } = Opt,
+               Opts) ->
++  Enabled = portchannel_mgr:enabled (),
+   CNotIf = not is_reg_if(If),
+   CNotInRange = not in_range(?LACP_PORT_CHANNEL_GROUP_MIN,
+                              ?LACP_PORT_CHANNEL_GROUP_MAX,
+@@ -84,7 +85,7 @@ validate_key (#co { key = ?LACP_PORT_CHANNEL_GROUP_KEY (If),
+                        action = set,
+                        value = { Group, _ } } <- Opts, Group == G],
+   Group_Size = length (lists:usort(New_Ports ++ Group_Ports)),
+-  CIncorrectSize = Group_Size > 16,
++  CIncorrectSize = Group_Size > ?LACP_PORT_CHANNEL_MAX_MEMBERS,
+   CIncorrectMode = not lists:member(M, [active, passive, on]),
+   CDot1xLacp = case dummy_conf:dget_pending (?DOT1X_PORT_CONTROL_KEY (If)) of
+                  {ok, 'force-authorized'} -> false;
+@@ -109,6 +110,9 @@ validate_key (#co { key = ?LACP_PORT_CHANNEL_GROUP_KEY (If),
+   if
+     CNotIf -> rdbg(?EINVALIDIF, Opt);
+     CNotInRange -> rdbg(?EOUTOFRANGE, Opt);
++    CIncorrectMode -> rdbg(?EINVAL, Opt);
++    %% membership policy and member synchronisation belong to the planner
++    Enabled -> rdbg (ok, [Opt]);
+     CNotTypeMismatch -> rdbg(?EINVALIDPORTTYPE, Opt);
+     CIncorrectSize -> rdbg(?EINVALGROUPSIZE, Opt);
+     CIncorrectMode -> rdbg(?EINVAL, Opt);
+diff --git a/manager/src/validator_utils.erl b/manager/src/validator_utils.erl
+index 948389ffb3..a7793b7180 100644
+--- a/manager/src/validator_utils.erl
++++ b/manager/src/validator_utils.erl
+@@ -188,7 +188,12 @@ config_if_slave (Fun) ->
+ 
+ get_pc_member_sync_opts ({ portchannel, _ } = PC, Opt, MakeKey, ShouldApply)
+ when is_function (MakeKey) andalso is_boolean (ShouldApply)->
+-  do_get_pc_member_sync_opts (PC, Opt, MakeKey, ShouldApply);
++  %% with the manager in charge the planner is the only place that
++  %% mirrors a group setting onto its members
++  case portchannel_mgr:enabled () of
++    true  -> [];
++    false -> do_get_pc_member_sync_opts (PC, Opt, MakeKey, ShouldApply)
++  end;
+ get_pc_member_sync_opts (_VIF, _KeyFun, _Opt, _ShouldApply) -> [].
+ 
+ 
+diff --git a/manager/src/wui_lacp.erl b/manager/src/wui_lacp.erl
+index 2c5f1cc28c..00d14797c4 100644
+--- a/manager/src/wui_lacp.erl
++++ b/manager/src/wui_lacp.erl
+@@ -321,40 +321,23 @@ ifs_edit (ID, Data) ->
+   Mode = gv("mode", Data, undefine ),
+   Mode_Old = get_port_ops (PortID, activ),
+   case AggID of
+-    [] -> node:call (master,
+-                          trunk_conf,
+-                          set_port_conf,
+-                          [IF,
+-                            [{channel_group, none}]]);
++    [] -> portchannel_mgr:leave (IF);
+     undefine -> case Mode of
+             undefine -> ok;
+             _ -> case AggID_Old of
+                     <<"">> -> {error, {"You can not change the mode, "
+                              "because the port is not a member of the group."}};
+-                    _ ->  node:call (master,
+-                          trunk_conf,
+-                          set_port_conf,
+-                          [IF,
+-                            [{channel_group,
+-                             {list_to_integer (binary_to_list (AggID_Old)),
+-                              list_to_existing_atom (Mode)}}]])
++                    _ -> portchannel_mgr:join (
++                           IF,
++                           list_to_integer (binary_to_list (AggID_Old)),
++                           list_to_existing_atom (Mode))
+                  end
+           end;
+     _ -> case Mode of
+-        undefine -> node:call (master,
+-                     trunk_conf,
+-                     set_port_conf,
+-                     [IF,
+-                    [{channel_group,
+-                     {list_to_integer (AggID),
+-                      Mode_Old}}]]);
+-        _ -> node:call (master,
+-                trunk_conf,
+-                set_port_conf,
+-                [IF,
+-                 [{channel_group,
+-                  {list_to_integer (AggID),
+-                   list_to_existing_atom (Mode)}}]])
++        undefine -> portchannel_mgr:join (IF, list_to_integer (AggID), Mode_Old);
++        _ -> portchannel_mgr:join (IF,
++                                   list_to_integer (AggID),
++                                   list_to_existing_atom (Mode))
+       end
+   end.
+ %%----------------------------------------------------------------------
+
+
+
+%%%---------------------------------------------------------------------
+%%% @doc PortChannel manager.
+%%%
+%%%      Runs on every node, takes decisions on the master only. Keeps a
+%%%      derived cache of the groups, offers the query and facade API for
+%%%      CLI, WUI and services, and reconciles the configuration after a
+%%%      configuration load, a master change or a failed transaction.
+%%%
+%%%      The manager never synchronises settings by itself: that is the
+%%%      planner's job inside the transaction. Everything here is either
+%%%      a query, a facade over dummy_conf or an idempotent repair.
+%%% @end
+%%%---------------------------------------------------------------------
+
+-module (portchannel_mgr).
+-behaviour (gen_server).
+
+-include ("config.hrl").
+-include ("validator.hrl").
+-include ("portchannel.hrl").
+-include ("debug.hrl").
+
+%% Runtime switch and load mode
+-export ([enabled/0,
+          load_in_progress/0]).
+
+%% Queries
+-export ([exists/1,
+          members/1,
+          pc_of/1,
+          portchannels/0,
+          pc_config/1,
+          status/0]).
+
+%% Facade
+-export ([create/2,
+          delete/1,
+          join/3,
+          leave/1]).
+
+%% Notifications
+-export ([load_started/0,
+          load_finished/0,
+          transaction_failed/1,
+          committed/1,
+          stack_changed/0,
+          audit/0,
+          audit/1]).
+
+-export ([start_link/0]).
+
+-export ([init/1,
+          handle_call/3,
+          handle_cast/2,
+          handle_info/2,
+          terminate/2,
+          code_change/3]).
+
+-record (s, {master = false}).
+
+%%%=====================================================================
+%%% Switch
+%%%=====================================================================
+
+%% @doc Transitional switch (one release): with the manager disabled the
+%%      old per-service synchronisation stays in charge.
+-spec enabled () -> boolean ().
+
+enabled () ->
+  case application:get_env (manager, ?PORTCHANNEL_MGR_ENV) of
+    {ok, Value} when is_boolean (Value) -> Value;
+    _                                   -> ?PORTCHANNEL_MGR_DEF
+  end.
+
+-spec load_in_progress () -> boolean ().
+
+load_in_progress () ->
+  flag (load_in_progress, false).
+
+%%%=====================================================================
+%%% Queries (pending view: the configuration as the running transaction
+%%% leaves it)
+%%%=====================================================================
+
+-spec exists (N :: pos_integer ()) -> boolean ().
+
+exists (N) ->
+  case dummy_conf:dget_pending (?PORTCHANNEL_KEY (N)) of
+    {ok, _} -> true;
+    _       -> false
+  end.
+
+-spec members (N :: pos_integer ()) -> [term ()].
+
+members (N) ->
+  lists:usort (
+    dummy_conf:select_pending (
+      [{{?LACP_PORT_CHANNEL_GROUP_KEY ('$1'), {N, '_'}}, [], ['$1']}])).
+
+-spec pc_of (If :: term ()) -> {ok, pos_integer ()} | none.
+
+pc_of (If) ->
+  case dummy_conf:dget_pending (?LACP_PORT_CHANNEL_GROUP_KEY (If)) of
+    {ok, {N, _Mode}} when is_integer (N) -> {ok, N};
+    _                                    -> none
+  end.
+
+-spec portchannels () -> [pos_integer ()].
+
+portchannels () ->
+  Keys = dummy_conf:match_key_pending (?PORTCHANNEL_KEY ('_')),
+  lists:usort ([ N || {?PORTCHANNEL_KEY (N), _V} <- Keys ]).
+
+-spec pc_config (N :: pos_integer ()) -> [{term (), term ()}].
+
+pc_config (N) ->
+  PC = {portchannel, N},
+  [ {Key, Value}
+    || {Key, Value} <- all_pending (),
+       case portchannel_registry:classify (Key) of
+         {ok, _Class, Vif} -> Vif == PC;
+         unknown           -> false
+       end ].
+
+-spec status () -> [{pos_integer (), [term ()], [term ()]}].
+
+status () ->
+  [ {N, members (N), pc_status (N)} || N <- portchannels () ].
+
+%%%=====================================================================
+%%% Facade (runs in the caller process)
+%%%=====================================================================
+
+-spec create (N :: pos_integer (), Origin :: manual | auto) ->
+        ok | {error, term ()}.
+
+create (N, _Origin) when is_integer (N) ->
+  case valid_id (N) of
+    true  -> dummy_conf:set (?PORTCHANNEL_KEY (N), true);
+    false -> {error, invalid_portchannel}
+  end;
+create (_N, _Origin) ->
+  {error, invalid_portchannel}.
+
+-spec delete (N :: pos_integer ()) -> ok | {error, term ()}.
+
+delete (N) when is_integer (N) ->
+  case exists (N) of
+    true  -> dummy_conf:unset (?PORTCHANNEL_KEY (N));
+    false -> {error, portchannel_not_found}
+  end;
+delete (_N) ->
+  {error, invalid_portchannel}.
+
+-spec join (If :: term (), N :: pos_integer (), Mode :: atom ()) ->
+        ok | {error, term ()}.
+
+join (If, N, Mode) ->
+  dummy_conf:set (?LACP_PORT_CHANNEL_GROUP_KEY (If), {N, Mode}).
+
+-spec leave (If :: term ()) -> ok | {error, term ()}.
+
+leave (If) ->
+  dummy_conf:unset (?LACP_PORT_CHANNEL_GROUP_KEY (If)).
+
+%%%=====================================================================
+%%% Notifications
+%%%=====================================================================
+
+load_started () ->
+  set_flag (load_in_progress, true),
+  ok.
+
+load_finished () ->
+  set_flag (load_in_progress, false),
+  cast ({audit, load_finished}),
+  ok.
+
+transaction_failed (Bundle) ->
+  cast ({transaction_failed, Bundle}).
+
+committed (Changes) ->
+  cast ({committed, Changes}).
+
+stack_changed () ->
+  cast (stack_changed).
+
+audit () ->
+  audit (manual).
+
+audit (Reason) ->
+  cast ({audit, Reason}).
+
+%%%=====================================================================
+%%% gen_server
+%%%=====================================================================
+
+start_link () ->
+  gen_server:start_link ({local, ?MODULE}, ?MODULE, [], []).
+
+init ([]) ->
+  tables (),
+  dummy_conf_event:add_handler (portchannel_eh),
+  stack_event:add_handler (portchannel_eh),
+  State = #s{master = is_master ()},
+  rebuild_cache (),
+  {ok, State}.
+
+handle_call (status, _From, State) ->
+  {reply, status (), State};
+handle_call (_Request, _From, State) ->
+  {reply, {error, undefined}, State}.
+
+handle_cast ({committed, Changes}, State) ->
+  ?DBG("[MGR] committed: ~p structural changes~n",
+       [length([C || C <- Changes, structural(C)])]),
+  case lists:any (fun structural/1, Changes) of
+    true ->
+      rebuild_cache (),
+      notify_changed (Changes);
+    false ->
+      ok
+  end,
+  {noreply, State};
+
+handle_cast ({transaction_failed, _Bundle}, State) ->
+  %% the configuration is unchanged, the hardware may be half way
+  %% through: drive it back to what the configuration says
+  do_audit (transaction_failed),
+  {noreply, State};
+
+handle_cast ({audit, Reason}, State) ->
+  do_audit (Reason),
+  {noreply, State};
+
+handle_cast (stack_changed, State) ->
+  Master = is_master (),
+  NewState = State#s{master = Master},
+  case Master andalso not State#s.master of
+    true ->
+      rebuild_cache (),
+      do_audit (master_changed),
+      redrive_membership ();
+    false ->
+      rebuild_cache ()
+  end,
+  {noreply, NewState};
+
+handle_cast (_Msg, State) ->
+  {noreply, State}.
+
+handle_info ({gen_event_EXIT, portchannel_eh, _Reason}, State) ->
+  ?DBG ("portchannel_mgr: event handler restarted~n", []),
+  catch dummy_conf_event:add_handler (portchannel_eh),
+  catch stack_event:add_handler (portchannel_eh),
+  {noreply, State};
+handle_info (_Info, State) ->
+  {noreply, State}.
+
+terminate (_Reason, _State) ->
+  ok.
+
+code_change (_OldVsn, State, _Extra) ->
+  {ok, State}.
+
+%%%=====================================================================
+%%% Cache
+%%%=====================================================================
+
+tables () ->
+  [ create_table (T) || T <- [?PC_TAB_PC, ?PC_TAB_MEMBER,
+                              ?PC_TAB_STATUS, ?PC_TAB_FLAGS] ],
+  ok.
+
+create_table (Name) ->
+  case ets:info (Name) of
+    undefined -> ets:new (Name, [named_table, public, set]);
+    _         -> Name
+  end.
+
+rebuild_cache () ->
+  case ets:info (?PC_TAB_PC) of
+    undefined ->
+      ok;
+    _ ->
+      ets:delete_all_objects (?PC_TAB_PC),
+      ets:delete_all_objects (?PC_TAB_MEMBER),
+      [ ets:insert (?PC_TAB_PC, {N, members (N)}) || N <- portchannels () ],
+      [ ets:insert (?PC_TAB_MEMBER, {If, N})
+        || N <- portchannels (), If <- members (N) ],
+      ok
+  end.
+
+pc_status (N) ->
+  case ets:info (?PC_TAB_STATUS) of
+    undefined -> [];
+    _         -> [ {Target, Class, Status}
+                   || {{Pc, Target, Class}, Status} <-
+                        ets:tab2list (?PC_TAB_STATUS), Pc == N ]
+  end.
+
+set_status (N, Target, Class, Status) ->
+  case ets:info (?PC_TAB_STATUS) of
+    undefined -> ok;
+    _         -> ets:insert (?PC_TAB_STATUS,
+                             {{N, Target, Class}, {Status, os:timestamp ()}})
+  end.
+
+flag (Name, Default) ->
+  case ets:info (?PC_TAB_FLAGS) of
+    undefined ->
+      Default;
+    _ ->
+      case ets:lookup (?PC_TAB_FLAGS, Name) of
+        [{_Name, Value}] -> Value;
+        []               -> Default
+      end
+  end.
+
+set_flag (Name, Value) ->
+  create_table (?PC_TAB_FLAGS),
+  ets:insert (?PC_TAB_FLAGS, {Name, Value}).
+
+structural ({Key, _Action}) ->
+  case portchannel_registry:classify (Key) of
+    {ok, #pc_class{scope = membership}, _} -> true;
+    {ok, #pc_class{scope = entity}, _}     -> true;
+    _                                      -> false
+  end.
+
+notify_changed (Changes) ->
+  PCs = lists:usort (
+          [ N || {Key, _A} <- Changes,
+                 N <- [pc_of_key (Key)],
+                 N =/= none ]),
+  [ catch evm:notify ({portchannel, {changed, N}}) || N <- PCs ],
+  ok.
+
+pc_of_key (Key) ->
+  case portchannel_registry:classify (Key) of
+    {ok, #pc_class{scope = membership}, If} ->
+      case pc_of (If) of
+        {ok, N} -> N;
+        none    -> none
+      end;
+    {ok, _Class, {portchannel, N}} ->
+      N;
+    _ ->
+      none
+  end.
+
+%%%=====================================================================
+%%% Audit (reconciliation)
+%%%=====================================================================
+
+do_audit (Reason) ->
+  case enabled () andalso is_master () andalso not load_in_progress () of
+    false -> ok;
+    true ->
+      ?DBG("[MGR] === AUDIT START (~p) ===~n", [Reason]),
+      Migrate = (Reason == load_finished),
+      {Sets, Unsets} = audit_config (Migrate),
+      ?DBG("[MGR] AUDIT config repair: ~p sets, ~p unsets~n", [length(Sets), length(Unsets)]),
+      apply_repair (Sets, Unsets),
+      audit_runtime (Reason),
+      ok
+  end.
+
+%% A1 .. A3, A7: configuration level invariants.
+audit_config (Migrate) ->
+  All = all_applied (),
+  Existing = portchannels (),
+  Missing = audit_entities (All, Existing),
+  {CopySets, CopyUnsets} = audit_copies (Existing),
+  Orphans = audit_orphan_refs (All, Existing),
+  Dups = case Migrate of
+           true  -> audit_duplicate_refs (All);
+           false -> []
+         end,
+  { Missing ++ CopySets, CopyUnsets ++ Orphans ++ Dups }.
+
+%% A1: every referenced group has an entity key.
+audit_entities (All, Existing) ->
+  Referenced =
+    lists:usort (
+      [ N || {Key, Value} <- All,
+             N <- [referenced_pc (Key, Value)],
+             N =/= none ]),
+  [ {?PORTCHANNEL_KEY (N), true}
+    || N <- Referenced, not lists:member (N, Existing) ].
+
+referenced_pc (Key, Value) ->
+  case portchannel_registry:classify (Key) of
+    {ok, #pc_class{scope = membership}, _If} ->
+      case Value of
+        {N, _Mode} when is_integer (N) -> N;
+        _                              -> none
+      end;
+    {ok, #pc_class{scope = entity}, _} ->
+      none;
+    {ok, _Class, {portchannel, N}} ->
+      N;
+    _ ->
+      none
+  end.
+
+%% A2: a member carries exactly the inherited settings of its group.
+audit_copies (Existing) ->
+  lists:foldl (
+    fun (N, {Sets, Unsets}) ->
+      PcKeys = [ {K, V} || {K, V} <- pc_config (N), inherited_key (K) ],
+      lists:foldl (
+        fun (If, {S0, U0}) ->
+          S1 = S0 ++ [ {PortKey, V}
+                       || {K, V} <- PcKeys,
+                          {ok, PortKey} <- [portchannel_registry:port_key (K, If)],
+                          dummy_conf:dget (PortKey) =/= {ok, V} ],
+          U1 = U0 ++ [ PortKey
+                       || {PortKey, _PV} <- member_inherited_keys (If),
+                          not has_pc_counterpart (PortKey, N) ],
+          {S1, U1}
+        end,
+        {Sets, Unsets},
+        members (N))
+    end,
+    {[], []},
+    Existing).
+
+inherited_key (Key) ->
+  case portchannel_registry:classify (Key) of
+    {ok, Class, _Vif} -> portchannel_registry:inherited (Class);
+    unknown           -> false
+  end.
+
+member_inherited_keys (If) ->
+  [ {Key, Value} || {Key, Value} <- all_applied (),
+                    inherited_key (Key),
+                    case portchannel_registry:classify (Key) of
+                      {ok, _C, Vif} -> Vif == If;
+                      unknown       -> false
+                    end ].
+
+has_pc_counterpart (PortKey, N) ->
+  case portchannel_registry:pc_key (PortKey, N) of
+    {ok, PcKey} -> dummy_conf:dget (PcKey) =/= {error, not_found};
+    unknown     -> true
+  end.
+
+%% A3: global references to a group that does not exist any more.
+audit_orphan_refs (All, Existing) ->
+  [ Key || {Key, _V} <- All,
+           case portchannel_registry:classify (Key) of
+             {ok, #pc_class{scope = global}, {portchannel, N}} ->
+               not lists:member (N, Existing);
+             _ ->
+               false
+           end ].
+
+%% A7 (Q9): global references duplicated onto members by the old
+%% synchronisation. Removed once, when the configuration is loaded.
+audit_duplicate_refs (All) ->
+  [ Key
+    || {Key, _V} <- All,
+       case portchannel_registry:classify (Key) of
+         {ok, #pc_class{scope = global, id = Id}, Vif}
+           when Id == igmp_mrouter; Id == igmp_static ->
+             duplicate_of_pc (Key, Vif);
+         _ ->
+           false
+       end ].
+
+duplicate_of_pc (Key, Vif) ->
+  case portchannel_registry:is_pc (Vif) of
+    true ->
+      false;
+    false ->
+      case pc_of (Vif) of
+        none ->
+          false;
+        {ok, N} ->
+          case portchannel_registry:pc_key (Key, N) of
+            {ok, PcKey} -> dummy_conf:dget (PcKey) =/= {error, not_found};
+            unknown     -> false
+          end
+      end
+  end.
+
+apply_repair ([], []) ->
+  ok;
+apply_repair (Sets, Unsets) ->
+  ?DBG ("portchannel_mgr: repair ~p set, ~p unset~n",
+        [length (Sets), length (Unsets)]),
+  UnsetBundle = case lists:usort (Unsets) of
+                  []    -> [];
+                  Keys  -> [{unset, Keys}]
+                end,
+  SetBundle = case Sets of
+                [] -> [];
+                _  -> [{set, Sets}]
+              end,
+  Bundles = UnsetBundle ++ SetBundle,
+  case catch dummy_conf:transaction (Bundles) of
+    ok ->
+      ok;
+    Error ->
+      ?DBG ("portchannel_mgr: repair failed: ~p~n", [Error]),
+      ok
+  end.
+
+%% A4 .. A6: runtime state of the services.
+audit_runtime (Reason) ->
+  [ begin
+      Members = members (N),
+      [ set_status (N, If, membership, ok) || If <- Members ],
+      case Reason of
+        master_changed -> redrive_pc (N, Members);
+        _              -> ok
+      end,
+      touch_refs (N)
+    end
+    || N <- portchannels () ],
+  ok.
+
+redrive_membership () ->
+  [ redrive_pc (N, members (N)) || N <- portchannels () ],
+  ok.
+
+redrive_pc (N, Members) ->
+  [ begin
+      case dummy_conf:dget (?LACP_PORT_CHANNEL_GROUP_KEY (If)) of
+        {ok, {N, Mode}} ->
+          catch node:call (node:master (), trunk_conf, set_port_conf,
+                           [If, [{channel_group, {N, Mode}}]]),
+          portchannel_hw:on_member_added (N, If, Mode);
+        _ ->
+          ok
+      end
+    end
+    || If <- Members ],
+  ok.
+
+%% A6: re-drive the hardware expansion of global references.
+touch_refs (N) ->
+  PC = {portchannel, N},
+  Keys = [ Key
+           || {Key, _V} <- all_applied (),
+              case portchannel_registry:classify (Key) of
+                {ok, #pc_class{scope = global}, Vif} -> Vif == PC;
+                _                                    -> false
+              end ],
+  case Keys of
+    [] -> ok;
+    _  -> catch dummy_conf:reapply (Keys), ok
+  end.
+
+%%%=====================================================================
+%%% Internal
+%%%=====================================================================
+
+valid_id (N) ->
+  is_integer (N) andalso
+  N >= ?LACP_PORT_CHANNEL_GROUP_MIN andalso
+  N =< ?LACP_PORT_CHANNEL_GROUP_MAX.
+
+is_master () ->
+  case catch node:this () == node:master () of
+    true -> true;
+    _    -> false
+  end.
+
+all_pending () ->
+  dummy_conf:select_pending ([{{'$1', '$2'}, [], [{{'$1', '$2'}}]}]).
+
+all_applied () ->
+  dummy_conf:select ([{{'$1', '$2'}, [], [{{'$1', '$2'}}]}]).
+
+cast (Msg) ->
+  catch gen_server:cast (?MODULE, Msg),
+  ok.
+
+
+
+%%%---------------------------------------------------------------------
+%%% @doc Configurator of the PortChannel subsystem.
+%%%
+%%%      Applied last, after every other subsystem of the transaction.
+%%%      Drives the services that follow membership rather than
+%%%      configuration keys (spanning tree, dhcp snooping bindings,
+%%%      errdisable). Never writes configuration.
+%%% @end
+%%%---------------------------------------------------------------------
+
+-module (config_portchannel).
+
+-include ("config.hrl").
+-include ("validator.hrl").
+-include ("portchannel.hrl").
+-include ("debug.hrl").
+
+-export ([apply/1]).
+
+-spec apply (Opts :: [option ()]) -> ok.
+
+apply (Opts) ->
+  case portchannel_mgr:enabled () of
+    false -> ok;
+    true  -> hooks (Opts)
+  end.
+
+%%%=====================================================================
+%%% Internal functions
+%%%=====================================================================
+
+hooks (Opts) ->
+  Deleted = [ N || #co{key = ?PORTCHANNEL_KEY (N), action = unset} <- Opts ],
+  Deltas = deltas (Opts),
+  ?DBG("[CFG_PC] apply hooks: Deleted=~p, Deltas=~p~n", [Deleted, Deltas]),
+  [ portchannel_hw:on_member_added (N, If, Mode)
+    || {added, If, N, Mode} <- Deltas ],
+  [ portchannel_hw:on_member_removed (N, If)
+    || {removed, If, N} <- Deltas, not lists:member (N, Deleted) ],
+  [ portchannel_hw:on_pc_deleted (N, [ If || {removed, If, M} <- Deltas,
+                                             M == N ])
+    || N <- Deleted ],
+  ok.
+
+%% The applied table still holds the state before the transaction, the
+%% option itself carries the state after it.
+deltas (Opts) ->
+  lists:flatten (
+    [ delta (Opt) || Opt <- Opts, is_membership (Opt) ]).
+
+is_membership (#co{key = Key}) ->
+  case portchannel_registry:classify (Key) of
+    {ok, #pc_class{scope = membership}, _If} -> true;
+    _                                        -> false
+  end.
+
+delta (#co{key = ?LACP_PORT_CHANNEL_GROUP_KEY (If) = Key} = Opt) ->
+  Before = case dummy_conf:dget (Key) of
+             {ok, {OldN, _OldM}} when is_integer (OldN) -> OldN;
+             _                                          -> none
+           end,
+  After = case Opt of
+            #co{action = set, value = {NewN, NewM}} when is_integer (NewN) ->
+              {NewN, NewM};
+            _ ->
+              none
+          end,
+  membership_delta (If, Before, After);
+delta (_Opt) ->
+  [].
+
+membership_delta (_If, Same, {Same, _Mode}) ->
+  [];
+membership_delta (If, none, {New, Mode}) ->
+  [{added, If, New, Mode}];
+membership_delta (If, Old, none) when is_integer (Old) ->
+  [{removed, If, Old}];
+membership_delta (If, Old, {New, Mode}) when is_integer (Old) ->
+  [{removed, If, Old}, {added, If, New, Mode}];
+membership_delta (_If, _Before, _After) ->
+  [].
+
+
+
+
+
+-ifndef (__PORTCHANNEL_HRL__).
+-define (__PORTCHANNEL_HRL__, included).
+
+-record (pc_class, { id,
+                     scope       = interface,
+                     ref,
+                     applicable  = allow,
+                     inherit     = copy,
+                     realization = chip,
+                     empty_pc    = apply,
+                     status      = confirmed
+                   }).
+
+-define (PORTCHANNEL_MGR_ENV, portchannel_mgr_enabled).
+-define (PORTCHANNEL_MGR_DEF, true).
+
+-define (PC_TAB_PC,     pc_mgr_pc).
+-define (PC_TAB_MEMBER, pc_mgr_member).
+-define (PC_TAB_STATUS, pc_mgr_status).
+-define (PC_TAB_FLAGS,  pc_mgr_flags).
+
+-endif.
+
+
+
+
+
+%%%---------------------------------------------------------------------
+%%% @doc PortChannel event handler.
+%%%
+%%%      Collects the PortChannel related keys of a committed transaction
+%%%      and hands them to the manager once the transaction is done.
+%%%      Also forwards stack changes. Never calls anything synchronously.
+%%% @end
+%%%---------------------------------------------------------------------
+
+-module (portchannel_eh).
+-behaviour (gen_event).
+
+-include ("portchannel.hrl").
+-include ("debug.hrl").
+
+-export ([init/1,
+          handle_event/2,
+          handle_call/2,
+          handle_info/2,
+          terminate/2,
+          code_change/3]).
+
+-record (state, {keys = []}).
+
+init ([]) ->
+  {ok, #state{}}.
+
+handle_event ({dummy_conf, transaction_done}, #state{keys = []} = State) ->
+  {ok, State};
+handle_event ({dummy_conf, transaction_done}, #state{keys = Keys} = State) ->
+  ?DBG("[EH] transaction_done: forwarding ~p PC keys to mgr~n", [length(Keys)]),
+  portchannel_mgr:committed (lists:reverse (Keys)),
+  {ok, State#state{keys = []}};
+handle_event ({dummy_conf, {Key, Action}}, #state{keys = Keys} = State) ->
+  case portchannel_registry:classify (Key) of
+    unknown -> {ok, State};
+    {ok, Class, _Vif} -> 
+      ?DBG("[EH] collected key: ~p ~p (class: ~p)~n", [Action, Key, Class#pc_class.id]),
+      {ok, State#state{keys = [{Key, Action} | Keys]}}
+  end;
+handle_event ({stack, {nodeup, _}}, State) ->
+  portchannel_mgr:stack_changed (),
+  {ok, State};
+handle_event ({stack, {nodedown, _}}, State) ->
+  portchannel_mgr:stack_changed (),
+  {ok, State};
+handle_event (_Event, State) ->
+  {ok, State}.
+
+handle_call (_Request, State) ->
+  {ok, ok, State}.
+
+handle_info (_Info, State) ->
+  {ok, State}.
+
+terminate (_Reason, _State) ->
+  ok.
+
+code_change (_OldVsn, State, _Extra) ->
+  {ok, State}.
+
+
+
+
+%%%---------------------------------------------------------------------
+%%% @doc PortChannel hardware and service adapter.
+%%%
+%%%      Two things live here:
+%%%
+%%%      1. the capability table of the chip, i.e. which operations the
+%%%         packet processor accepts for a logical trunk interface, which
+%%%         of them it repeats for a port that joins later and which ones
+%%%         have to be expanded to physical ports by the manager;
+%%%
+%%%      2. the hooks for services that are driven by membership rather
+%%%         than by configuration keys (spanning tree, dhcp snooping
+%%%         bindings, errdisable state).
+%%%
+%%%      Hooks run on the master only and never touch the configuration.
+%%% @end
+%%%---------------------------------------------------------------------
+
+-module (portchannel_hw).
+
+-include ("config.hrl").
+-include ("debug.hrl").
+
+-export ([on_member_added/3,
+          on_member_removed/2,
+          on_pc_deleted/2]).
+
+-export ([capabilities/0,
+          capability/1,
+          expansion/1]).
+
+%%%=====================================================================
+%%% Membership hooks
+%%%=====================================================================
+
+-spec on_member_added (N :: pos_integer (), If :: term (), Mode :: atom ()) -> ok.
+
+on_member_added (N, If, Mode) ->
+  on_master (
+    fun () ->
+      call (stp_mgr, mst_set_trunk_ports, [If, N]),
+      call (stp_mgr, event,
+            [{set, {?LACP_PORT_CHANNEL_GROUP_KEY (If), {N, Mode}}}]),
+      multicall (dhcp_snp, binding_del_on_vif, [If]),
+      ok
+    end).
+
+-spec on_member_removed (N :: pos_integer (), If :: term ()) -> ok.
+
+on_member_removed (_N, If) ->
+  on_master (
+    fun () ->
+      call (stp_mgr, mst_set_trunk_ports, [If, none]),
+      call (stp_mgr, event,
+            [{set, {?LACP_PORT_CHANNEL_GROUP_KEY (If),
+                    ?LACP_PORT_CHANNEL_GROUP_DEF}}]),
+      ok
+    end).
+
+-spec on_pc_deleted (N :: pos_integer (), Members :: [term ()]) -> ok.
+
+on_pc_deleted (N, Members) ->
+  on_master (
+    fun () ->
+      [ begin
+          call (stp_mgr, mst_set_trunk_ports, [If, none]),
+          call (stp_mgr, event,
+                [{set, {?LACP_PORT_CHANNEL_GROUP_KEY (If),
+                        ?LACP_PORT_CHANNEL_GROUP_DEF}}])
+        end
+        || If <- Members ],
+      multicall (dhcp_snp, binding_del_on_vif, [{portchannel, N}]),
+      catch errdisable:activate_iface ({portchannel, N}),
+      ok
+    end).
+
+%%%=====================================================================
+%%% Capability table
+%%%=====================================================================
+
+%% {Operation, TrunkMethod, ChipFanOut, ReplayOnJoin, ErlangExpansion,
+%%  Idempotent, Resource}
+%%
+%% TrunkMethod   — presteramgr vif_trunk_proc_init has an entry
+%% ChipFanOut    — the chip applies the operation to the current members
+%% ReplayOnJoin  — the chip repeats it for a port that joins later
+%% Idempotent    — re-applying the same value is safe (set semantics)
+%% Resource      — allocated resource that needs a compensating release
+
+capabilities () ->
+  [ {vif_mode,             true,  true,  false, none,   true,  none},
+    {vif_access_vlan,      true,  true,  false, none,   true,  none},
+    {vif_native_vlan,      true,  true,  false, none,   true,  none},
+    {vif_customer_vlan,    true,  true,  false, none,   true,  none},
+    {vif_trunk_vlans,      true,  true,  false, none,   true,  none},
+    {vif_hybrid_mode,      true,  true,  false, none,   true,  none},
+    {vif_voice_vlan,       true,  true,  false, none,   true,  none},
+    {vif_speed,            true,  true,  false, none,   true,  none},
+    {vif_duplex,           true,  true,  false, none,   true,  none},
+    {vif_flow_control,     true,  true,  false, none,   true,  none},
+    {vif_shutdown,         true,  true,  false, member, true,  none},
+    {vif_block,            true,  true,  false, none,   true,  none},
+    {vif_community,        true,  true,  false, none,   true,  none},
+    {vif_protected,        true,  true,  false, none,   true,  none},
+    {vif_pve_dst,          true,  true,  false, none,   true,  none},
+    {vif_vlan_translate,   true,  true,  false, none,   true,  none},
+    {vif_dot1q_tunnel,     true,  true,  false, none,   true,  none},
+    {vif_dgasp,            true,  true,  false, none,   true,  none},
+    {vif_stp_state,        true,  true,  false, none,   true,  none},
+    {vif_mcg,              true,  true,  true,  none,   true,  vidx},
+    {trunk_members,        false, false, false, none,   true,  trunk},
+    {port_traffic_shape,   false, false, false, member, true,  shaper},
+    {port_user_acl,        false, false, false, shared, true,  pcl},
+    {port_qos_policy,      false, false, false, shared, false, policer},
+    {port_pbr,             false, false, false, shared, true,  pcl},
+    {mon_session_src,      false, false, false, shared, true,  session}
+  ].
+
+capability (Op) ->
+  lists:keyfind (Op, 1, capabilities ()).
+
+%% Where a class has to be expanded: the chip does it, the manager does
+%% it through member copies, or a service does it by itself.
+expansion (chip)     -> chip;
+expansion (member)   -> member_copies;
+expansion (shared)   -> service;
+expansion (logical)  -> service;
+expansion (software) -> none;
+expansion (none)     -> none.
+
+%%%=====================================================================
+%%% Internal
+%%%=====================================================================
+
+on_master (Fun) ->
+  case node:this () == node:master () of
+    true ->
+      case catch Fun () of
+        {'EXIT', Reason} ->
+          ?DBG ("portchannel_hw: hook failed: ~p~n", [Reason]),
+          ok;
+        _ ->
+          ok
+      end;
+    false ->
+      ok
+  end.
+
+call (Mod, Fun, Args) ->
+  catch node:call (node:master (), Mod, Fun, Args).
+
+multicall (Mod, Fun, Args) ->
+  catch node:multicall (Mod, Fun, Args).
+
+
+
+
+
+%%%---------------------------------------------------------------------
+%%% @doc PortChannel transaction planner.
+%%%
+%%%      The single place where synchronisation between a PortChannel and
+%%%      its physical members is decided. Runs inside the dummy_conf
+%%%      process, between the validator fold and the apply multicall.
+%%%
+%%%      Pure with respect to the world: reads the two configuration
+%%%      tables (applied = state before the transaction, validated =
+%%%      state after it), keeps its own overlay of generated options and
+%%%      returns them. No gen_server calls, no hardware, no writes.
+%%% @end
+%%%---------------------------------------------------------------------
+
+-module (portchannel_planner).
+
+-include ("config.hrl").
+-include ("validator.hrl").
+-include ("portchannel.hrl").
+-include ("debug.hrl").
+
+-export ([plan/4]).
+
+-record (ctx, { applied,
+                validated,
+                load    = false,
+                overlay = #{},
+                ops     = [] }).
+
+%%%=====================================================================
+%%% API
+%%%=====================================================================
+
+%% @doc Plan the PortChannel part of a transaction.
+%%      Returns the final option list (original options, possibly with
+%%      rewritten apply flags, plus generated ones) and the generated
+%%      options alone, so that the caller can put them into the
+%%      validated table.
+-spec plan (ValidOpts :: [#co{}],
+            Applied   :: atom (),
+            Validated :: atom (),
+            LoadMode  :: boolean ()) ->
+        {ok, [#co{}], [#co{}]} | {error, term ()}.
+
+plan (ValidOpts, Applied, Validated, LoadMode) ->
+  ?DBG("[PLANNER] === plan called: ~p opts, LoadMode=~p ===~n",
+       [length(ValidOpts), LoadMode]),
+  try
+    Ctx0 = #ctx{applied = Applied, validated = Validated, load = LoadMode},
+    case is_relevant (ValidOpts, Ctx0) of
+      false ->
+        ?DBG("[PLANNER] not relevant, skipping~n", []),
+        {ok, ValidOpts, []};
+      true ->
+        Ctx1 = phase_a (ValidOpts, Ctx0),
+        ?DBG("[PLANNER] Phase A done. Overlay size: ~p~n", [maps:size(Ctx1#ctx.overlay)]),
+        Ctx2 = phase_b (ValidOpts, Ctx1),
+        ?DBG("[PLANNER] Phase B done. Overlay size: ~p~n", [maps:size(Ctx2#ctx.overlay)]),
+        Ctx3 = phase_c (ValidOpts, Ctx2),
+        Generated = lists:reverse (Ctx3#ctx.ops),
+        ?DBG("[PLANNER] Phase C done. Generated ~p ops:~n", [length(Generated)]),
+        [ ?DBG("[PLANNER]   -> ~p ~p = ~p (apply=~p)~n",
+               [O#co.action, O#co.key, O#co.value, O#co.apply]) || O <- Generated ],
+        Final = rewrite_apply (ValidOpts, Ctx3) ++ Generated,
+        {ok, Final, Generated}
+    end
+  catch
+    throw:{pc_error, Error} ->
+      ?DBG("[PLANNER] REJECTED: ~p~n", [Error]),
+      {error, Error};
+    Class:Reason ->
+      ?DBG ("[PLANNER] CRASH: ~w: ~p~n~p~n",
+            [Class, Reason, erlang:get_stacktrace ()]),
+      {error, ?EPCINTERNAL}
+  end.
+
+%%%=====================================================================
+%%% Phase A: structure
+%%%=====================================================================
+
+phase_a (Opts, Ctx0) ->
+  Deleted = [ N || #co{key = Key, action = unset} <- Opts,
+                   {ok, N} <- [entity_pc (Key)] ],
+  Ctx1 = lists:foldl (fun cascade_delete/2, Ctx0, Deleted),
+  Ctx2 = auto_create (Opts, Deleted, Ctx1),
+  ok = check_global_refs (Opts, Ctx2),
+  ok = check_denied (Opts),
+  ok = check_member_edit (Opts, Ctx2),
+  Ctx3 = lists:foldl (fun (If, Acc) -> check_join (If, Acc) end,
+                      Ctx2,
+                      [ If || {added, If, _N} <- membership_delta (Opts, Ctx2) ]),
+  Ctx3.
+
+%% Cascade: members leave, inherited copies are reset, PC keys and global
+%% references go away (Q7 + Q1).
+cascade_delete (N, Ctx0) ->
+  PC = {portchannel, N},
+  Members = after_members (N, Ctx0),
+  Ctx1 =
+    lists:foldl (
+      fun (If, Acc0) ->
+        Acc1 = emit (Acc0, unset, ?LACP_PORT_CHANNEL_GROUP_KEY (If), undefined, true),
+        strip_member (If, N, Acc1)
+      end,
+      Ctx0,
+      Members),
+  Ctx2 =
+    lists:foldl (
+      fun ({Key, _V}, Acc) ->
+        case portchannel_registry:classify (Key) of
+          {ok, Class, _Vif} ->
+            emit (Acc, unset, Key, undefined,
+                  portchannel_registry:pc_apply (Class, []));
+          unknown ->
+            emit (Acc, unset, Key, undefined, true)
+        end
+      end,
+      Ctx1,
+      vif_keys (PC, Ctx1) ++ refs_to (PC, Ctx1)),
+  drop_value_refs (PC, Ctx2).
+
+%% Inherited settings of a member are reset to default when the whole
+%% group is removed (Q1).
+strip_member (If, N, Ctx0) ->
+  lists:foldl (
+    fun ({Key, _V}, Acc) ->
+      case portchannel_registry:classify (Key) of
+        {ok, Class, _Vif} ->
+          case portchannel_registry:inherited (Class) of
+            true ->
+              case portchannel_registry:pc_key (Key, N) of
+                {ok, PcKey} ->
+                  case after_lookup (PcKey, Acc) of
+                    none -> Acc;
+                    _    -> emit (Acc, unset, Key, undefined, true)
+                  end;
+                unknown -> Acc
+              end;
+            false -> Acc
+          end;
+        unknown -> Acc
+      end
+    end,
+    Ctx0,
+    vif_keys (If, Ctx0)).
+
+%% Keys whose value points at the PortChannel (flex-link backup,
+%% protected destination).
+drop_value_refs ({portchannel, N} = PC, Ctx0) ->
+  Refs = [ Key
+           || {Key, Value} <- all_after (Ctx0),
+              value_refers_to (Value, PC, N) ],
+  lists:foldl (fun (Key, Acc) -> emit (Acc, unset, Key, undefined, true) end,
+               Ctx0,
+               Refs).
+
+value_refers_to ({portchannel, N}, _PC, N)  -> true;
+value_refers_to ([portchannel, N], _PC, N)  -> true;
+value_refers_to (_, _, _)                   -> false.
+
+%% Q8: any PortChannel scoped write creates the group, a global reference
+%% to a missing group is an error.
+auto_create (Opts, Deleted, Ctx0) ->
+  Wanted =
+    lists:usort (
+      [ N || #co{key = Key} = Opt <- Opts,
+             {ok, N} <- [creating_pc (Key, Opt)],
+             not lists:member (N, Deleted) ]),
+  lists:foldl (
+    fun (N, Acc) ->
+      case after_lookup (?PORTCHANNEL_KEY (N), Acc) of
+        none -> emit (Acc, set, ?PORTCHANNEL_KEY (N), true, true);
+        _    -> Acc
+      end
+    end,
+    Ctx0,
+    Wanted).
+
+creating_pc (Key, Opt = #co{action = Action}) ->
+  case portchannel_registry:classify (Key) of
+    {ok, #pc_class{scope = global}, _Vif} ->
+      %% a reference never creates the group it points at
+      unknown;
+    {ok, #pc_class{scope = entity}, {portchannel, N}} when Action == set ->
+      {ok, N};
+    {ok, #pc_class{scope = membership}, _If} ->
+      %% channel-group N: the group is named by the value
+      case Opt of
+        #co{action = set, value = {N, _Mode}} when is_integer (N) -> {ok, N};
+        _                                                         -> unknown
+      end;
+    {ok, _Class, {portchannel, N}} when Action == set ->
+      {ok, N};
+    _ ->
+      unknown
+  end.
+
+check_global_refs (Opts, Ctx) ->
+  lists:foreach (
+    fun (#co{key = Key, action = set}) ->
+          case portchannel_registry:classify (Key) of
+            {ok, #pc_class{scope = global}, {portchannel, N}} ->
+              case after_lookup (?PORTCHANNEL_KEY (N), Ctx) of
+                none -> fail (?EPCNOTFOUND);
+                _    -> ok
+              end;
+            _ ->
+              ok
+          end;
+        (_) ->
+          ok
+    end,
+    Opts),
+  ok.
+
+check_denied (Opts) ->
+  lists:foreach (
+    fun (#co{key = Key}) ->
+      case portchannel_registry:classify (Key) of
+        {ok, Class, {portchannel, _N}} ->
+          case portchannel_registry:applicable (Class) of
+            allow        -> ok;
+            {deny, Tag}  -> fail ({error, {Tag, atom_to_list (Tag)}})
+          end;
+        _ ->
+          ok
+      end
+    end,
+    Opts),
+  ok.
+
+%% Q5: an inherited setting may not be edited on a member directly.
+check_member_edit (_Opts, #ctx{load = true}) ->
+  ok;
+check_member_edit (Opts, Ctx) ->
+  lists:foreach (
+    fun (#co{key = Key} = Opt) ->
+      case portchannel_registry:classify (Key) of
+        {ok, Class, Vif} ->
+          case portchannel_registry:is_pc (Vif) of
+            true ->
+              ok;
+            false ->
+              case portchannel_registry:inherited (Class) of
+                true  -> check_member_key (Opt, Class, Vif, Ctx);
+                false -> ok
+              end
+          end;
+        unknown ->
+          ok
+      end
+    end,
+    Opts),
+  ok.
+
+check_member_key (#co{key = Key} = Opt, _Class, If, Ctx) ->
+  case pc_of (If, Ctx) of
+    none ->
+      ok;
+    {ok, N} ->
+      case portchannel_registry:pc_key (Key, N) of
+        unknown ->
+          ok;
+        {ok, PcKey} ->
+          PcValue = after_lookup (PcKey, Ctx),
+          OptValue = case Opt of
+                       #co{action = set, value = V} -> {ok, V};
+                       #co{action = unset}          -> none
+                     end,
+          case PcValue == OptValue of
+            true  -> ok;
+            false -> fail (?EPCINHERITED)
+          end
+      end
+  end.
+
+%% Port type, group capacity and settings that forbid joining.
+check_join (If, Ctx) ->
+  case pc_of (If, Ctx) of
+    none ->
+      Ctx;
+    {ok, N} ->
+      Members = after_members (N, Ctx),
+      check_capacity (Members),
+      check_port_type (If, Members),
+      check_conflicts (If, Ctx),
+      Ctx
+  end.
+
+check_capacity (Members) ->
+  case length (Members) > portchannel_registry:max_members () of
+    true  -> fail (?EINVALGROUPSIZE);
+    false -> ok
+  end.
+
+check_port_type ({Type, _, _}, Members) ->
+  Others = [ T || {T, _, _} <- Members, T =/= Type ],
+  case Others of
+    [] -> ok;
+    _  -> fail (?EINVALIDPORTTYPE)
+  end;
+check_port_type (_If, _Members) ->
+  ok.
+
+check_conflicts (If, Ctx) ->
+  lists:foreach (
+    fun ({KeyFun, Default, Error}) ->
+      case after_lookup (KeyFun (If), Ctx) of
+        none          -> ok;
+        {ok, Default} -> ok;
+        {ok, _Other}  -> fail (Error)
+      end
+    end,
+    portchannel_registry:join_conflicts ()),
+  ok.
+
+%%%=====================================================================
+%%% Phase B: settings closure
+%%%=====================================================================
+
+phase_b (Opts, Ctx0) ->
+  Delta = membership_delta (Opts, Ctx0),
+  Ctx1 = lists:foldl (fun ({added, If, N}, Acc)   -> join_closure (If, N, Acc);
+                          ({removed, If, N}, Acc) -> leave_closure (If, N, Acc)
+                      end,
+                      Ctx0,
+                      Delta),
+  lists:foldl (fun (Opt, Acc) -> setting_closure (Opt, Acc) end, Ctx1, Opts).
+
+%% A port that joins takes over every inherited setting of the group and
+%% loses its own values in those classes (port_to_pc semantics).
+join_closure (If, N, Ctx0) ->
+  PC = {portchannel, N},
+  Ctx1 =
+    lists:foldl (
+      fun ({PcKey, Value}, Acc) ->
+        case portchannel_registry:classify (PcKey) of
+          {ok, Class, _} ->
+            case portchannel_registry:inherited (Class) of
+              true  -> copy_to_member (Class, PcKey, Value, If, Acc);
+              false -> Acc
+            end;
+          unknown ->
+            Acc
+        end
+      end,
+      Ctx0,
+      vif_keys (PC, Ctx0)),
+  %% settings the port had on its own in inherited classes are dropped
+  lists:foldl (
+    fun ({PortKey, _V}, Acc) ->
+      case portchannel_registry:classify (PortKey) of
+        {ok, Class, _} ->
+          case portchannel_registry:inherited (Class) of
+            true ->
+              case portchannel_registry:pc_key (PortKey, N) of
+                {ok, PcKey} ->
+                  case after_lookup (PcKey, Acc) of
+                    none -> emit (Acc, unset, PortKey, undefined, true);
+                    _    -> Acc
+                  end;
+                unknown ->
+                  Acc
+              end;
+            false ->
+              Acc
+          end;
+        unknown ->
+          Acc
+      end
+    end,
+    Ctx1,
+    vif_keys (If, Ctx1)).
+
+copy_to_member (Class, PcKey, Value, If, Ctx) ->
+  case portchannel_registry:port_key (PcKey, If) of
+    unknown ->
+      Ctx;
+    {ok, PortKey} ->
+      Current = after_lookup (PortKey, Ctx),
+      case portchannel_registry:join_action (Class) of
+        detach_and_touch ->
+          Ctx1 = case Current of
+                   none -> Ctx;
+                   _    -> emit (Ctx, unset, PortKey, undefined, true)
+                 end,
+          emit (Ctx1, set, PortKey, Value, false);
+        copy_only ->
+          case Current of
+            {ok, Value} -> Ctx;
+            _           -> emit (Ctx, set, PortKey, Value, false)
+          end;
+        replay_copy ->
+          case Current of
+            {ok, Value} -> Ctx;
+            _           -> emit (Ctx, set, PortKey, Value, true)
+          end
+      end
+  end.
+
+%% Q2: a port that leaves keeps the settings; classes whose member copy
+%% was not applied on its own are materialised now.
+leave_closure (If, _N, Ctx0) ->
+  lists:foldl (
+    fun ({PortKey, Value}, Acc) ->
+      case portchannel_registry:classify (PortKey) of
+        {ok, Class, _} ->
+          case portchannel_registry:inherited (Class) andalso
+               portchannel_registry:leave_action (Class) == keep_materialize of
+            true  -> emit (Acc, set, PortKey, Value, true);
+            false -> Acc
+          end;
+        unknown ->
+          Acc
+      end
+    end,
+    Ctx0,
+    vif_keys (If, Ctx0)).
+
+%% A setting written on the group is mirrored to the current members.
+setting_closure (#co{key = Key} = Opt, Ctx) ->
+  case portchannel_registry:classify (Key) of
+    {ok, Class, {portchannel, N}} ->
+      case portchannel_registry:inherited (Class) of
+        true  -> fan_out (Class, Opt, N, Ctx);
+        false -> Ctx
+      end;
+    _ ->
+      Ctx
+  end.
+
+fan_out (Class, #co{key = PcKey, action = Action, value = Value}, N, Ctx) ->
+  Apply = portchannel_registry:copy_apply (Class),
+  lists:foldl (
+    fun (If, Acc) ->
+      case portchannel_registry:port_key (PcKey, If) of
+        unknown ->
+          Acc;
+        {ok, PortKey} ->
+          case Action of
+            set ->
+              case after_lookup (PortKey, Acc) of
+                {ok, Value} -> Acc;
+                _           -> emit (Acc, set, PortKey, Value, Apply)
+              end;
+            unset ->
+              case after_lookup (PortKey, Acc) of
+                none -> Acc;
+                _    -> emit (Acc, unset, PortKey, undefined, Apply)
+              end
+          end
+      end
+    end,
+    Ctx,
+    after_members (N, Ctx)).
+
+%%%=====================================================================
+%%% Phase C: hardware expansion refresh
+%%%=====================================================================
+
+phase_c (Opts, Ctx0) ->
+  Changed = lists:usort ([ N || {_What, _If, N} <- membership_delta (Opts, Ctx0) ]),
+  lists:foldl (fun (N, Acc) -> refresh_expansion (N, Acc) end, Ctx0, Changed).
+
+refresh_expansion (N, Ctx0) ->
+  PC = {portchannel, N},
+  case after_lookup (?PORTCHANNEL_KEY (N), Ctx0) of
+    none ->
+      %% the group is gone, nothing to recompute
+      Ctx0;
+    _ ->
+      Members = after_members (N, Ctx0),
+      lists:foldl (
+        fun ({Key, Value}, Acc) ->
+          case portchannel_registry:classify (Key) of
+            {ok, Class, _} ->
+              case portchannel_registry:touch_on_members_changed (Class) of
+                true  -> touch (Class, Key, Value, Members, Acc);
+                false -> Acc
+              end;
+            unknown ->
+              Acc
+          end
+        end,
+        Ctx0,
+        vif_keys (PC, Ctx0) ++ refs_to (PC, Ctx0))
+  end.
+
+touch (Class, Key, Value, Members, Ctx) ->
+  case portchannel_registry:pc_apply (Class, Members) of
+    true ->
+      emit (Ctx, set, Key, Value, true);
+    false ->
+      %% shared resource of an empty group: release it, keep the config
+      Ctx1 = emit (Ctx, unset, Key, undefined, true),
+      emit (Ctx1, set, Key, Value, false)
+  end.
+
+%%%=====================================================================
+%%% Membership
+%%%=====================================================================
+
+membership_delta (Opts, Ctx) ->
+  lists:foldl (
+    fun (#co{key = Key} = Opt, Acc) ->
+      case portchannel_registry:classify (Key) of
+        {ok, #pc_class{scope = membership}, If} ->
+          Before = group_of (before_lookup (Key, Ctx)),
+          After  = group_of (case Opt of
+                               #co{action = set, value = V} -> {ok, V};
+                               #co{action = unset}          -> none
+                             end),
+          delta (If, Before, After) ++ Acc;
+        _ ->
+          Acc
+      end
+    end,
+    [],
+    Opts).
+
+group_of ({ok, {N, _Mode}}) when is_integer (N) -> N;
+group_of (_)                                    -> none.
+
+delta (_If, Same, Same)      -> [];
+delta (If, none, New)        -> [{added, If, New}];
+delta (If, Old, none)        -> [{removed, If, Old}];
+delta (If, Old, New)         -> [{removed, If, Old}, {added, If, New}].
+
+after_members (N, Ctx) ->
+  Base = ets:select (Ctx#ctx.validated,
+                     [{{?LACP_PORT_CHANNEL_GROUP_KEY ('$1'), {N, '_'}}, [], ['$1']}]),
+  Overlay = Ctx#ctx.overlay,
+  Added = [ If || {Key, {set, {G, _}}} <- maps:to_list (Overlay),
+                  G == N,
+                  {ok, #pc_class{scope = membership}, If} <-
+                    [portchannel_registry:classify (Key)] ],
+  Removed = [ If || {Key, Entry} <- maps:to_list (Overlay),
+                    {ok, #pc_class{scope = membership}, If} <-
+                      [portchannel_registry:classify (Key)],
+                    not_in_group (Entry, N) ],
+  lists:usort ((Base ++ Added) -- Removed).
+
+not_in_group (unset, _N)          -> true;
+not_in_group ({set, {G, _}}, N)   -> G =/= N;
+not_in_group (_, _)               -> true.
+
+pc_of (If, Ctx) ->
+  case after_lookup (?LACP_PORT_CHANNEL_GROUP_KEY (If), Ctx) of
+    {ok, {N, _Mode}} when is_integer (N) -> {ok, N};
+    _                                    -> none
+  end.
+
+entity_pc (Key) ->
+  case portchannel_registry:classify (Key) of
+    {ok, #pc_class{scope = entity}, {portchannel, N}} -> {ok, N};
+    _                                                 -> unknown
+  end.
+
+%%%=====================================================================
+%%% Option bookkeeping
+%%%=====================================================================
+
+is_relevant (Opts, Ctx) ->
+  lists:any (fun (Opt) -> relevant_opt (Opt, Ctx) end, Opts).
+
+relevant_opt (#co{key = Key}, Ctx) ->
+  case portchannel_registry:classify (Key) of
+    {ok, #pc_class{scope = membership}, _} ->
+      true;
+    {ok, #pc_class{scope = entity}, _} ->
+      true;
+    {ok, Class, Vif} ->
+      case portchannel_registry:is_pc (Vif) of
+        true ->
+          true;
+        false ->
+          %% a setting written on a port that is a member of a group
+          portchannel_registry:inherited (Class) andalso
+          pc_of (Vif, Ctx) =/= none
+      end;
+    unknown ->
+      false
+  end.
+
+%% The apply flag of a PortChannel key depends on how the class reaches
+%% the hardware: shadow classes are stored, not executed.
+rewrite_apply (Opts, Ctx) ->
+  [ rewrite_opt (Opt, Ctx) || Opt <- Opts ].
+
+rewrite_opt (#co{key = Key} = Opt, Ctx) ->
+  case portchannel_registry:classify (Key) of
+    {ok, #pc_class{scope = interface} = Class, {portchannel, N}} ->
+      Members = after_members (N, Ctx),
+      Opt#co{apply = portchannel_registry:pc_apply (Class, Members)};
+    _ ->
+      Opt
+  end.
+
+emit (Ctx, set, Key, Value, Apply) ->
+  Op = #co{key = Key, value = Value, action = set, apply = Apply},
+  Ctx#ctx{ops = [Op | Ctx#ctx.ops],
+          overlay = maps:put (Key, {set, Value}, Ctx#ctx.overlay)};
+emit (Ctx, unset, Key, _Value, Apply) ->
+  Op = #co{key = Key, action = unset, apply = Apply},
+  Ctx#ctx{ops = [Op | Ctx#ctx.ops],
+          overlay = maps:put (Key, unset, Ctx#ctx.overlay)}.
+
+fail (Error) ->
+  throw ({pc_error, Error}).
+
+%%%=====================================================================
+%%% Table access (after = validated + overlay, before = applied)
+%%%=====================================================================
+
+after_lookup (Key, #ctx{overlay = Overlay, validated = Tab}) ->
+  case maps:find (Key, Overlay) of
+    {ok, unset}      -> none;
+    {ok, {set, V}}   -> {ok, V};
+    error ->
+      case ets:lookup (Tab, Key) of
+        []          -> none;
+        [{_Key, V}] -> {ok, V}
+      end
+  end.
+
+before_lookup (Key, #ctx{applied = Tab}) ->
+  case ets:lookup (Tab, Key) of
+    []          -> none;
+    [{_Key, V}] -> {ok, V}
+  end.
+
+%% Every key of the given VIF, as the transaction leaves it.
+vif_keys (Vif, Ctx) ->
+  [ {Key, Value} || {Key, Value} <- all_after (Ctx),
+                    key_of_vif (Key, Vif) ].
+
+key_of_vif (Key, Vif) ->
+  case portchannel_registry:classify (Key) of
+    {ok, #pc_class{scope = Scope}, Vif} when Scope == interface ->
+      true;
+    _ ->
+      false
+  end.
+
+%% Global references pointing at the given PortChannel.
+refs_to (Vif, Ctx) ->
+  [ {Key, Value} || {Key, Value} <- all_after (Ctx),
+                    ref_of_vif (Key, Vif) ].
+
+ref_of_vif (Key, Vif) ->
+  case portchannel_registry:classify (Key) of
+    {ok, #pc_class{scope = global}, Vif} -> true;
+    _                                    -> false
+  end.
+
+all_after (#ctx{validated = Tab, overlay = Overlay}) ->
+  Base = ets:foldl (fun ({Key, Value}, Acc) ->
+                        case maps:is_key (Key, Overlay) of
+                          true  -> Acc;
+                          false -> [{Key, Value} | Acc]
+                        end
+                    end,
+                    [],
+                    Tab),
+  Base ++ [ {Key, Value} || {Key, {set, Value}} <- maps:to_list (Overlay) ].
+
+
+
+
+
+
+%%%---------------------------------------------------------------------
+%%% @doc PortChannel settings registry.
+%%%
+%%%      Declarative description of every configuration class the
+%%%      PortChannel manager has to reason about: how the VIF is embedded
+%%%      into the key, whether the setting is inherited by members, how it
+%%%      reaches the hardware and what has to happen on membership change.
+%%%
+%%%      Pure module: no processes, no ETS, no side effects.
+%%% @end
+%%%---------------------------------------------------------------------
+
+-module (portchannel_registry).
+
+-compile ({no_auto_import, [is_port/1]}).
+
+-include ("config.hrl").
+-include ("validator.hrl").
+-include ("portchannel.hrl").
+
+-export ([classify/1,
+          class/1,
+          vif_of/1,
+          rekey/2,
+          pc_key/2,
+          port_key/2,
+          applicable/1,
+          inherited/1,
+          scope_of/1,
+          pc_apply/2,
+          copy_apply/1,
+          join_action/1,
+          leave_action/1,
+          delete_action/1,
+          touch_on_members_changed/1,
+          max_members/0,
+          join_conflicts/0,
+          is_vif/1,
+          is_pc/1,
+          is_port/1,
+          tag_vif/1]).
+
+%%%=====================================================================
+%%% API
+%%%=====================================================================
+
+%% @doc Classify a configuration key. Unknown keys are not managed:
+%%      the planner leaves them exactly as they are today.
+-spec classify (Key :: term ()) ->
+        {ok, #pc_class{}, Vif :: term ()} | unknown.
+
+classify (Key) ->
+  case describe (Key) of
+    unknown ->
+      unknown;
+    ClassId ->
+      Class = class (ClassId),
+      case vif_at (Class#pc_class.ref, Key) of
+        {ok, Vif} ->
+          case is_vif (Vif) of
+            true  -> {ok, Class, Vif};
+            false -> unknown
+          end;
+        error ->
+          unknown
+      end
+  end.
+
+%% @doc Extract the VIF a key belongs to.
+-spec vif_of (Key :: term ()) -> {ok, term ()} | unknown.
+
+vif_of (Key) ->
+  case classify (Key) of
+    {ok, _Class, Vif} -> {ok, Vif};
+    unknown           -> unknown
+  end.
+
+%% @doc Rebuild a key for another VIF (PC -> member or member -> PC).
+-spec rekey (Key :: term (), Vif :: term ()) -> {ok, term ()} | unknown.
+
+rekey (Key, Vif) ->
+  case describe (Key) of
+    unknown ->
+      unknown;
+    ClassId ->
+      Class = class (ClassId),
+      set_vif (Class#pc_class.ref, Key, Vif)
+  end.
+
+-spec pc_key (Key :: term (), N :: pos_integer ()) -> {ok, term ()} | unknown.
+
+pc_key (Key, N) ->
+  rekey (Key, {portchannel, N}).
+
+-spec port_key (Key :: term (), If :: term ()) -> {ok, term ()} | unknown.
+
+port_key (Key, If) ->
+  rekey (Key, If).
+
+-spec applicable (#pc_class{}) -> allow | {deny, atom ()}.
+
+applicable (#pc_class{applicable = A}) -> A.
+
+-spec inherited (#pc_class{}) -> boolean ().
+
+inherited (#pc_class{inherit = copy, scope = interface}) -> true;
+inherited (_)                                            -> false.
+
+-spec scope_of (#pc_class{}) -> atom ().
+
+scope_of (#pc_class{scope = S}) -> S.
+
+%% @doc Should the PC key itself be handed to its configurator?
+%%      Members :: current (pending) member list of the PC.
+-spec pc_apply (#pc_class{}, Members :: [term ()]) -> boolean ().
+
+pc_apply (#pc_class{realization = member}, _Members)  -> false;
+pc_apply (#pc_class{realization = none}, _Members)    -> false;
+pc_apply (#pc_class{realization = shared, empty_pc = shadow}, []) -> false;
+pc_apply (_Class, _Members)                           -> true.
+
+%% @doc Should a member copy be handed to its configurator in steady state?
+-spec copy_apply (#pc_class{}) -> boolean ().
+
+copy_apply (#pc_class{realization = member})   -> true;
+copy_apply (#pc_class{realization = software}) -> true;
+copy_apply (_)                                 -> false.
+
+%% @doc What has to happen with a member copy when the port joins.
+-spec join_action (#pc_class{}) -> replay_copy | copy_only | detach_and_touch.
+
+join_action (#pc_class{realization = shared})   -> detach_and_touch;
+join_action (#pc_class{realization = logical})  -> copy_only;
+join_action (_)                                 -> replay_copy.
+
+%% @doc What has to happen when the port leaves (settings are kept, Q2).
+-spec leave_action (#pc_class{}) -> keep | keep_materialize.
+
+leave_action (#pc_class{realization = member})   -> keep;
+leave_action (#pc_class{realization = software}) -> keep;
+leave_action (_)                                 -> keep_materialize.
+
+%% @doc What has to happen when the whole PC is deleted (Q1: reset to default).
+-spec delete_action (#pc_class{}) -> strip_copies_and_unset | unset.
+
+delete_action (#pc_class{scope = interface, inherit = copy}) -> strip_copies_and_unset;
+delete_action (_)                                            -> unset.
+
+%% @doc Classes whose hardware expansion has to be recomputed when the
+%%      member list changes.
+-spec touch_on_members_changed (#pc_class{}) -> boolean ().
+
+touch_on_members_changed (#pc_class{scope = global})        -> true;
+touch_on_members_changed (#pc_class{realization = shared})  -> true;
+touch_on_members_changed (_)                                -> false.
+
+-spec max_members () -> pos_integer ().
+
+max_members () -> ?LACP_PORT_CHANNEL_MAX_MEMBERS.
+
+%% @doc Port settings that forbid joining a group while set to a non
+%%      default value. {KeyMaker, DefaultValue, ErrorTerm}.
+join_conflicts () ->
+  [ {fun (If) -> ?DOT1X_PORT_CONTROL_KEY (If) end,
+     'force-authorized', ?ECONFDOT1XLACP},
+    {fun (If) -> ?PORT_STORM_CONTROL_KEY (If) end,
+     [broadcast, 0], ?ECONFQOSLACP},
+    {fun (If) -> ?PORT_SEC_EN_KEY (If) end,
+     false, ?ECONFPSLACP},
+    {fun (If) -> ?PORT_VOICE_VLAN_KEY (If) end,
+     0, ?ECONFVOICEVLANLACP}
+  ].
+
+%%%=====================================================================
+%%% VIF helpers
+%%%=====================================================================
+
+is_vif (Vif) -> is_pc (Vif) orelse is_port (Vif).
+
+is_pc ({portchannel, N}) when is_integer (N) -> true;
+is_pc (_)                                    -> false.
+
+is_port ({T, U, N}) when is_atom (T), is_integer (U), is_integer (N) -> true;
+is_port (_)                                                          -> false.
+
+%% {port, If} for physical ports, {portchannel, N} for groups.
+tag_vif ({portchannel, _N} = PC) -> PC;
+tag_vif (If)                     -> {port, If}.
+
+untag_vif ({port, If})            -> If;
+untag_vif ({portchannel, _} = PC) -> PC;
+untag_vif (Other)                 -> Other.
+
+%%%=====================================================================
+%%% Key shape -> class
+%%%=====================================================================
+
+describe ({switchport, _Vif, What})                          -> switchport_class (What);
+describe ({network, {port, _}, location})                    -> description;
+describe ({dying_gasp, {port, _}, oam})                      -> dgasp_oam;
+describe ({arp_inspection, _, trusted})                      -> arp_trust;
+describe ({snp, {port, _}, trusted})                         -> snp_trust;
+describe ({logging, _, link})                                -> logging_link;
+describe ({stp, {port, _}, _})                               -> stp_port;
+describe ({mstp_conf, {{inst, _}, {port, _}}, _})            -> mst_inst_port;
+describe ({mstp_conf, {port, _}, _})                         -> mst_port;
+describe ({pvrst_conf, {port, _}, _})                        -> pvrst_port;
+describe ({igmp, snooping, {{vlan, _}, {port, _}, mrouter}}) -> igmp_mrouter;
+describe ({igmp, snooping, {{vlan, _}, {port, _}, {ip, _}}}) -> igmp_static;
+describe ({igmp, _Vif, _})                                   -> igmp_if;
+describe ({mld, _Vif, _})                                    -> mld_if;
+describe ({ip_source_guard, _, _})                           -> ipsg;
+describe ({{pppoe, agent}, _})                               -> pppoe_ia;
+describe ({acl, 'service-acl', {_, _}})                      -> acl_service;
+describe ({service_policy, _})                               -> qos_policy;
+describe ({service_pbr, _})                                  -> pbr;
+describe ({'flex-link', _})                                  -> flex_link;
+describe ({monitor, {session, _}, {source, {port, _}}})      -> monitor_source;
+describe ({mclag, {member, _}})                              -> mclag_member;
+describe ({lacp, {port, _}, channel_group})                  -> membership;
+describe ({portchannel, {portchannel, _}, created})          -> entity;
+describe (_)                                                 -> unknown.
+
+switchport_class (traffic_shape)                -> traffic_shape;
+switchport_class ({traffic_shape, _})           -> traffic_shape;
+switchport_class (voice_vlan)                   -> voice_vlan;
+switchport_class (storm_control)                -> storm_control;
+switchport_class ('rate-limit')                 -> rate_limit;
+switchport_class (alarm_link_redled)            -> alarm_link;
+%% settings that exist on a physical port only: they are rejected on a
+%% group and stay untouched on a member
+switchport_class (alarm_link_relay)             -> port_only;
+switchport_class (storm_control_action)         -> port_only;
+switchport_class (pvid)                         -> port_only;
+switchport_class (mdix_auto)                    -> port_only;
+switchport_class (preferred_media)              -> port_only;
+switchport_class ('macgroup-binding')           -> port_only;
+switchport_class ('protocolgroup-binding')      -> port_only;
+switchport_class ('subnetgroup-binding')        -> port_only;
+switchport_class ({qcn, _})                     -> port_only;
+switchport_class ({qos_trust, _})               -> port_only;
+switchport_class ({ip, address})                -> port_only;
+switchport_class ({ip, address_secondary, _})   -> port_only;
+switchport_class (mode)                         ->  switchport_mode_member;
+switchport_class ({mode, _Mode})                ->  switchport_mode_member;
+switchport_class (_)                            -> port_l2.
+
+%%%=====================================================================
+%%% Class table
+%%%=====================================================================
+
+%% Interface scope, inherited by members.
+class (port_l2) ->
+  #pc_class{id = port_l2, ref = {raw, 2}, realization = chip};
+class (traffic_shape) ->
+  #pc_class{id = traffic_shape, ref = {raw, 2}, realization = member,
+            empty_pc = shadow};
+class (dgasp_oam) ->
+  #pc_class{id = dgasp_oam, ref = {wrapped, 2}, realization = chip};
+class (arp_trust) ->
+  #pc_class{id = arp_trust, ref = {raw, 2}, realization = logical,
+            status = to_verify};
+class (logging_link) ->
+  #pc_class{id = logging_link, ref = {raw, 2}, realization = software};
+class (stp_port) ->
+  #pc_class{id = stp_port, ref = {wrapped, 2}, realization = logical,
+            status = to_verify};
+class (mst_port) ->
+  #pc_class{id = mst_port, ref = {wrapped, 2}, realization = logical,
+            status = to_verify};
+class (mst_inst_port) ->
+  #pc_class{id = mst_inst_port, ref = {mst_inst, 2}, realization = logical,
+            status = to_verify};
+class (pvrst_port) ->
+  #pc_class{id = pvrst_port, ref = {wrapped, 2}, realization = logical,
+            status = to_verify};
+class (igmp_if) ->
+  #pc_class{id = igmp_if, ref = {raw, 2}, realization = chip,
+            status = to_verify};
+class (mld_if) ->
+  #pc_class{id = mld_if, ref = {raw, 2}, realization = chip,
+            status = to_verify};
+class (ipsg) ->
+  #pc_class{id = ipsg, ref = {tagged, 2}, realization = logical,
+            status = to_verify};
+%% Only the base key has a shape we can rebuild for another VIF; the sub
+%% keys are nested, so the class stays uninherited and behaves as before.
+class (pppoe_ia) ->
+  #pc_class{id = pppoe_ia, ref = {raw, 2}, inherit = none,
+            realization = logical, status = to_verify};
+class (acl_service) ->
+  #pc_class{id = acl_service, ref = {acl, 3}, realization = shared,
+            empty_pc = shadow};
+class (qos_policy) ->
+  #pc_class{id = qos_policy, ref = {tagged, 2}, realization = shared,
+            empty_pc = shadow};
+class (pbr) ->
+  #pc_class{id = pbr, ref = {tagged, 2}, realization = shared,
+            empty_pc = shadow};
+
+%% Interface scope, not inherited.
+class (description) ->
+  #pc_class{id = description, ref = {wrapped, 2}, inherit = none,
+            realization = software};
+class (flex_link) ->
+  #pc_class{id = flex_link, ref = {raw, 2}, inherit = none,
+            realization = logical};
+
+%% Denied on a PortChannel: the CLI rejects them, the planner rejects the
+%% key should it ever appear.
+class (voice_vlan) ->
+  #pc_class{id = voice_vlan, ref = {raw, 2}, inherit = none,
+            realization = none, applicable = {deny, portchannel_denied}};
+class (storm_control) ->
+  #pc_class{id = storm_control, ref = {raw, 2}, inherit = none,
+            realization = none, applicable = {deny, portchannel_denied}};
+class (rate_limit) ->
+  #pc_class{id = rate_limit, ref = {raw, 2}, inherit = none,
+            realization = none,
+            applicable = {deny, portchannel_is_not_supported}};
+class (alarm_link) ->
+  #pc_class{id = alarm_link, ref = {raw, 2}, inherit = none,
+            realization = none,
+            applicable = {deny, portchannel_is_not_supported}};
+class (snp_trust) ->
+  #pc_class{id = snp_trust, ref = {wrapped, 2}, inherit = none,
+            realization = none,
+            applicable = {deny, portchannel_temporarily_is_not_supported}};
+class (port_only) ->
+  #pc_class{id = port_only, ref = {raw, 2}, inherit = none,
+            realization = none,
+            applicable = {deny, portchannel_is_not_supported}};
+
+%% Global scope: the PC is an argument, never duplicated onto members.
+class (monitor_source) ->
+  #pc_class{id = monitor_source, scope = global, ref = {monitor_src, 3},
+            inherit = none, realization = shared};
+class (igmp_mrouter) ->
+  #pc_class{id = igmp_mrouter, scope = global, ref = {igmp_snoop, 3},
+            inherit = none, realization = logical, status = to_verify};
+class (igmp_static) ->
+  #pc_class{id = igmp_static, scope = global, ref = {igmp_snoop, 3},
+            inherit = none, realization = logical, status = to_verify};
+class (mclag_member) ->
+  #pc_class{id = mclag_member, scope = global, ref = {mclag_member, 2},
+            inherit = none, realization = logical, status = to_verify};
+
+class(switchport_mode_member) ->
+  #pc_class{id = switchport_mode_member, scope = interface, ref = {raw, 2},
+                 realization = member, empty_pc = shadow};
+
+%% Structural keys.
+class (membership) ->
+  #pc_class{id = membership, scope = membership, ref = {wrapped, 2},
+            inherit = none, realization = none};
+class (entity) ->
+  #pc_class{id = entity, scope = entity, ref = {raw, 2},
+            inherit = none, realization = none}.
+
+%%%=====================================================================
+%%% VIF extraction / substitution
+%%%=====================================================================
+
+vif_at ({raw, Pos}, Key) when tuple_size (Key) >= Pos ->
+  {ok, element (Pos, Key)};
+vif_at ({wrapped, Pos}, Key) when tuple_size (Key) >= Pos ->
+  case element (Pos, Key) of
+    {port, Vif} -> {ok, Vif};
+    _           -> error
+  end;
+vif_at ({tagged, Pos}, Key) when tuple_size (Key) >= Pos ->
+  {ok, untag_vif (element (Pos, Key))};
+vif_at ({acl, Pos}, Key) when tuple_size (Key) >= Pos ->
+  case element (Pos, Key) of
+    {Tagged, _Dest} -> {ok, untag_vif (Tagged)};
+    _               -> error
+  end;
+vif_at ({mst_inst, Pos}, Key) when tuple_size (Key) >= Pos ->
+  case element (Pos, Key) of
+    {{inst, _I}, {port, Vif}} -> {ok, Vif};
+    _                         -> error
+  end;
+vif_at ({igmp_snoop, Pos}, Key) when tuple_size (Key) >= Pos ->
+  case element (Pos, Key) of
+    {{vlan, _V}, {port, Vif}, _K} -> {ok, Vif};
+    _                             -> error
+  end;
+vif_at ({monitor_src, Pos}, Key) when tuple_size (Key) >= Pos ->
+  case element (Pos, Key) of
+    {source, {port, Vif}} -> {ok, Vif};
+    _                     -> error
+  end;
+vif_at ({mclag_member, Pos}, Key) when tuple_size (Key) >= Pos ->
+  case element (Pos, Key) of
+    {member, Vif} -> {ok, Vif};
+    _             -> error
+  end;
+vif_at (_Ref, _Key) ->
+  error.
+
+set_vif ({raw, Pos}, Key, Vif) when tuple_size (Key) >= Pos ->
+  {ok, setelement (Pos, Key, Vif)};
+set_vif ({wrapped, Pos}, Key, Vif) when tuple_size (Key) >= Pos ->
+  {ok, setelement (Pos, Key, {port, Vif})};
+set_vif ({tagged, Pos}, Key, Vif) when tuple_size (Key) >= Pos ->
+  {ok, setelement (Pos, Key, tag_vif (Vif))};
+set_vif ({acl, Pos}, Key, Vif) when tuple_size (Key) >= Pos ->
+  case element (Pos, Key) of
+    {_Tagged, Dest} -> {ok, setelement (Pos, Key, {tag_vif (Vif), Dest})};
+    _               -> unknown
+  end;
+set_vif ({mst_inst, Pos}, Key, Vif) when tuple_size (Key) >= Pos ->
+  case element (Pos, Key) of
+    {{inst, I}, {port, _}} ->
+      {ok, setelement (Pos, Key, {{inst, I}, {port, Vif}})};
+    _ ->
+      unknown
+  end;
+set_vif ({igmp_snoop, Pos}, Key, Vif) when tuple_size (Key) >= Pos ->
+  case element (Pos, Key) of
+    {{vlan, V}, {port, _}, K} ->
+      {ok, setelement (Pos, Key, {{vlan, V}, {port, Vif}, K})};
+    _ ->
+      unknown
+  end;
+set_vif ({monitor_src, Pos}, Key, Vif) when tuple_size (Key) >= Pos ->
+  case element (Pos, Key) of
+    {source, {port, _}} ->
+      {ok, setelement (Pos, Key, {source, {port, Vif}})};
+    _ ->
+      unknown
+  end;
+set_vif ({mclag_member, Pos}, Key, Vif) when tuple_size (Key) >= Pos ->
+  case element (Pos, Key) of
+    {member, _} -> {ok, setelement (Pos, Key, {member, Vif})};
+    _           -> unknown
+  end;
+set_vif (_Ref, _Key, _Vif) ->
+  unknown.
+
+
+
+
+%%%---------------------------------------------------------------------
+%%% @doc Validator of the PortChannel subsystem.
+%%%
+%%%      Owns the entity key only. Every policy decision (inheritance,
+%%%      capacity, conflicts, denied classes) is taken by the planner, so
+%%%      that there is exactly one place where they live.
+%%% @end
+%%%---------------------------------------------------------------------
+
+-module (validator_portchannel).
+
+-include ("config.hrl").
+-include ("validator.hrl").
+-include ("portchannel.hrl").
+
+-export ([validate/1]).
+
+-spec validate (AllOpts :: [option ()]) ->
+        {[known_checked_option ()], [check_error ()]}.
+
+validate (Opts) ->
+  lists:foldl (fun validate_opt/2, {[], []}, Opts).
+
+validate_opt (Opt, {Valid, Errors}) ->
+  case validate_key (Opt) of
+    ignore       -> {Valid, Errors};
+    {ok, NewOpt} -> {[NewOpt | Valid], Errors};
+    {Error, Bad} -> {Valid, [{Error, Bad} | Errors]}
+  end.
+
+validate_key (#co{key = ?PORTCHANNEL_KEY (N), action = set, value = true} = Opt) ->
+  case utils:in_range (?LACP_PORT_CHANNEL_GROUP_MIN,
+                       ?LACP_PORT_CHANNEL_GROUP_MAX,
+                       N) of
+    true  -> {ok, Opt};
+    false -> {?EINCHANNEL, Opt}
+  end;
+validate_key (#co{key = ?PORTCHANNEL_KEY (_N), action = set} = Opt) ->
+  {?EINVAL, Opt};
+validate_key (#co{key = ?PORTCHANNEL_KEY (_N), action = unset} = Opt) ->
+  {ok, Opt};
+validate_key (_Opt) ->
+  ignore.
