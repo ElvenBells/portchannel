@@ -206,11 +206,10 @@ diff --git a/manager/src/config_port.erl b/manager/src/config_port.erl
 index 7405cc3f4e..18cbaf990d 100644
 --- a/manager/src/config_port.erl
 +++ b/manager/src/config_port.erl
-@@ -243,6 +243,7 @@ handle_set(?PORT_MDIX_AUTO_KEY(If), Value) ->
+@@ -243,6 +243,6 @@ handle_set(?PORT_MDIX_AUTO_KEY(If), Value) ->
    validator_utils:config_if_current(If, Fun);
  
  handle_set(?PORT_MODE_KEY(VIF) = Key, Value) ->
-+  io:format("handle_set(?PORT_MODE_KEY(VIF) = Key ~p, Value ~p) ~n", [VIF, Value]),
    Port = utils:if_to_index(VIF),
    Fun =
      case VIF of
@@ -225,11 +224,10 @@ diff --git a/manager/src/control.erl b/manager/src/control.erl
 index 2db4f61ca7..e02b9ecbad 100644
 --- a/manager/src/control.erl
 +++ b/manager/src/control.erl
-@@ -269,6 +269,7 @@ admin_process (Req, Mode, Type) ->
+@@ -269,6 +269,6 @@ admin_process (Req, Mode, Type) ->
        [dhcpv6, network, {Name}] ->
          dhcpv6_network_process (Req, Name);
        [interface, IFlist] ->
-+        io:format("interface adm proc ~p ~n", [true]),
          StackId = sysinfo:get_stack_id(),
          ProperIfList =
            case IFlist of
@@ -418,9 +416,12 @@ index 5670597337..47a79bcb61 100644
            reset/0]).
  
  %% For use only in validators!
-@@ -404,6 +405,17 @@ unlock() ->
+@@ -404,6 +405,19 @@ unlock() ->
  reset() ->
-   call(reset).
+-  call(reset).
++  Res = call(reset),
++  portchannel_mgr:reset_cache(),
++  Res.
  
 +%%--------------------------------------------------------------------
 +%% @doc Re-drives the configurators for the given keys with the value
@@ -841,7 +842,11 @@ index 2c5f1cc28c..00d14797c4 100644
 %%%      Runs on every node, takes decisions on the master only. Keeps a
 %%%      derived cache of the groups, offers the query and facade API for
 %%%      CLI, WUI and services, and reconciles the configuration after a
-%%%      configuration load, a master change or a failed transaction.
+%%%      configuration load or a failed transaction.
+%%%
+%%%      Stack reconfiguration goes through dummy_conf, so the manager
+%%%      receives dummy_conf events and keeps its cache up to date without
+%%%      tracking separate stack events.
 %%%
 %%%      The manager never synchronises settings by itself: that is the
 %%%      planner's job inside the transaction. Everything here is either
@@ -864,6 +869,9 @@ index 2c5f1cc28c..00d14797c4 100644
 %% Queries
 -export ([exists/1,
           members/1,
+          members/2,
+          local_members/1,
+          devices/1,
           pc_of/1,
           portchannels/0,
           pc_config/1,
@@ -880,7 +888,7 @@ index 2c5f1cc28c..00d14797c4 100644
           load_finished/0,
           transaction_failed/1,
           committed/1,
-          stack_changed/0,
+          reset_cache/0,
           audit/0,
           audit/1]).
 
@@ -893,7 +901,7 @@ index 2c5f1cc28c..00d14797c4 100644
           terminate/2,
           code_change/3]).
 
--record (s, {master = false}).
+-record (s, {}).
 
 %%%=====================================================================
 %%% Switch
@@ -933,6 +941,27 @@ members (N) ->
   lists:usort (
     dummy_conf:select_pending (
       [{{?LACP_PORT_CHANNEL_GROUP_KEY ('$1'), {N, '_'}}, [], ['$1']}])).
+
+%% @doc Members of PortChannel N located on a specific stack device/unit.
+-spec members (N :: pos_integer (), Unit :: pos_integer ()) -> [term ()].
+
+members (N, Unit) ->
+  [ If || {_Type, U, _Port} = If <- members (N), U == Unit ].
+
+%% @doc Members of PortChannel N located on the local stack unit.
+-spec local_members (N :: pos_integer ()) -> [term ()].
+
+local_members (N) ->
+  case catch sysinfo:get_stack_id () of
+    Unit when is_integer (Unit) -> members (N, Unit);
+    _                           -> members (N)
+  end.
+
+%% @doc Stack device IDs that currently have member ports in PortChannel N.
+-spec devices (N :: pos_integer ()) -> [pos_integer ()].
+
+devices (N) ->
+  lists:usort ([ U || {_Type, U, _Port} <- members (N) ]).
 
 -spec pc_of (If :: term ()) -> {ok, pos_integer ()} | none.
 
@@ -1019,8 +1048,12 @@ transaction_failed (Bundle) ->
 committed (Changes) ->
   cast ({committed, Changes}).
 
-stack_changed () ->
-  cast (stack_changed).
+%% @doc Reset and rebuild the manager cache (called on dummy_conf:reset/0).
+reset_cache () ->
+  clear_cache (),
+  rebuild_cache (),
+  cast (reset_cache),
+  ok.
 
 audit () ->
   audit (manual).
@@ -1038,10 +1071,8 @@ start_link () ->
 init ([]) ->
   tables (),
   dummy_conf_event:add_handler (portchannel_eh),
-  stack_event:add_handler (portchannel_eh),
-  State = #s{master = is_master ()},
   rebuild_cache (),
-  {ok, State}.
+  {ok, #s{}}.
 
 handle_call (status, _From, State) ->
   {reply, status (), State};
@@ -1060,6 +1091,11 @@ handle_cast ({committed, Changes}, State) ->
   end,
   {noreply, State};
 
+handle_cast (reset_cache, State) ->
+  clear_cache (),
+  rebuild_cache (),
+  {noreply, State};
+
 handle_cast ({transaction_failed, _Bundle}, State) ->
   %% the configuration is unchanged, the hardware may be half way
   %% through: drive it back to what the configuration says
@@ -1070,26 +1106,12 @@ handle_cast ({audit, Reason}, State) ->
   do_audit (Reason),
   {noreply, State};
 
-handle_cast (stack_changed, State) ->
-  Master = is_master (),
-  NewState = State#s{master = Master},
-  case Master andalso not State#s.master of
-    true ->
-      rebuild_cache (),
-      do_audit (master_changed),
-      redrive_membership ();
-    false ->
-      rebuild_cache ()
-  end,
-  {noreply, NewState};
-
 handle_cast (_Msg, State) ->
   {noreply, State}.
 
 handle_info ({gen_event_EXIT, portchannel_eh, _Reason}, State) ->
   ?DBG ("portchannel_mgr: event handler restarted~n", []),
   catch dummy_conf_event:add_handler (portchannel_eh),
-  catch stack_event:add_handler (portchannel_eh),
   {noreply, State};
 handle_info (_Info, State) ->
   {noreply, State}.
@@ -1114,6 +1136,14 @@ create_table (Name) ->
     undefined -> ets:new (Name, [named_table, public, set]);
     _         -> Name
   end.
+
+clear_cache () ->
+  [ case ets:info (T) of
+      undefined -> ok;
+      _         -> ets:delete_all_objects (T)
+    end
+    || T <- [?PC_TAB_PC, ?PC_TAB_MEMBER, ?PC_TAB_STATUS] ],
+  ok.
 
 rebuild_cache () ->
   case ets:info (?PC_TAB_PC) of
@@ -1241,11 +1271,12 @@ referenced_pc (Key, Value) ->
       none
   end.
 
-%% A2: a member carries exactly the inherited settings of its group.
+%% A2: a member carries the mirrored settings of its group for classes
+%% with show_run_dup enabled (or software mode).
 audit_copies (Existing) ->
   lists:foldl (
     fun (N, {Sets, Unsets}) ->
-      PcKeys = [ {K, V} || {K, V} <- pc_config (N), inherited_key (K) ],
+      PcKeys = [ {K, V} || {K, V} <- pc_config (N), mirrored_key (K) ],
       lists:foldl (
         fun (If, {S0, U0}) ->
           S1 = S0 ++ [ {PortKey, V}
@@ -1269,6 +1300,15 @@ inherited_key (Key) ->
     unknown           -> false
   end.
 
+mirrored_key (Key) ->
+  case portchannel_registry:classify (Key) of
+    {ok, Class, _Vif} ->
+      portchannel_registry:inherited (Class) andalso
+      portchannel_registry:show_run_dup (Class);
+    unknown ->
+      false
+  end.
+
 member_inherited_keys (If) ->
   [ {Key, Value} || {Key, Value} <- all_applied (),
                     inherited_key (Key),
@@ -1278,9 +1318,19 @@ member_inherited_keys (If) ->
                     end ].
 
 has_pc_counterpart (PortKey, N) ->
-  case portchannel_registry:pc_key (PortKey, N) of
-    {ok, PcKey} -> dummy_conf:dget (PcKey) =/= {error, not_found};
-    unknown     -> true
+  case portchannel_registry:classify (PortKey) of
+    {ok, Class, _Vif} ->
+      case portchannel_registry:show_run_dup (Class) of
+        false ->
+          false;
+        true ->
+          case portchannel_registry:pc_key (PortKey, N) of
+            {ok, PcKey} -> dummy_conf:dget (PcKey) =/= {error, not_found};
+            unknown     -> true
+          end
+      end;
+    unknown ->
+      true
   end.
 
 %% A3: global references to a group that does not exist any more.
@@ -1345,35 +1395,13 @@ apply_repair (Sets, Unsets) ->
   end.
 
 %% A4 .. A6: runtime state of the services.
-audit_runtime (Reason) ->
+audit_runtime (_Reason) ->
   [ begin
       Members = members (N),
       [ set_status (N, If, membership, ok) || If <- Members ],
-      case Reason of
-        master_changed -> redrive_pc (N, Members);
-        _              -> ok
-      end,
       touch_refs (N)
     end
     || N <- portchannels () ],
-  ok.
-
-redrive_membership () ->
-  [ redrive_pc (N, members (N)) || N <- portchannels () ],
-  ok.
-
-redrive_pc (N, Members) ->
-  [ begin
-      case dummy_conf:dget (?LACP_PORT_CHANNEL_GROUP_KEY (If)) of
-        {ok, {N, Mode}} ->
-          catch node:call (node:master (), trunk_conf, set_port_conf,
-                           [If, [{channel_group, {N, Mode}}]]),
-          portchannel_hw:on_member_added (N, If, Mode);
-        _ ->
-          ok
-      end
-    end
-    || If <- Members ],
   ok.
 
 %% A6: re-drive the hardware expansion of global references.
@@ -1501,19 +1529,31 @@ membership_delta (_If, _Before, _After) ->
 
 
 
-
-
 -ifndef (__PORTCHANNEL_HRL__).
 -define (__PORTCHANNEL_HRL__, included).
 
+%% Execution modes:
+%%   hardware — commands that configure the PortChannel directly on the
+%%              chip and/or service;
+%%   software — commands that expand the PortChannel into regular member
+%%              interfaces and apply settings to each member separately;
+%%   none     — structural or denied commands.
+%%
+%% Specifics such as duplicating output in `show run`, copying settings
+%% to/from member interfaces, and re-applying on membership changes are
+%% controlled by explicit boolean flags in #pc_class{}.
 -record (pc_class, { id,
-                     scope       = interface,
+                     scope                 = interface,
                      ref,
-                     applicable  = allow,
-                     inherit     = copy,
-                     realization = chip,
-                     empty_pc    = apply,
-                     status      = confirmed
+                     applicable            = allow,
+                     mode                  = hardware,
+                     copy_settings         = true,
+                     show_run_dup          = true,
+                     replay_on_join        = false,
+                     detach_on_join        = false,
+                     reapply_on_membership = false,
+                     apply_on_empty        = true,
+                     status                = confirmed
                    }).
 
 -define (PORTCHANNEL_MGR_ENV, portchannel_mgr_enabled).
@@ -1528,14 +1568,14 @@ membership_delta (_If, _Before, _After) ->
 
 
 
-
-
 %%%---------------------------------------------------------------------
 %%% @doc PortChannel event handler.
 %%%
 %%%      Collects the PortChannel related keys of a committed transaction
 %%%      and hands them to the manager once the transaction is done.
-%%%      Also forwards stack changes. Never calls anything synchronously.
+%%%      Stack reconfiguration goes through dummy_conf, so no separate
+%%%      stack event subscription is needed. Never calls anything
+%%%      synchronously.
 %%% @end
 %%%---------------------------------------------------------------------
 
@@ -1563,19 +1603,17 @@ handle_event ({dummy_conf, transaction_done}, #state{keys = Keys} = State) ->
   ?DBG("[EH] transaction_done: forwarding ~p PC keys to mgr~n", [length(Keys)]),
   portchannel_mgr:committed (lists:reverse (Keys)),
   {ok, State#state{keys = []}};
+handle_event ({dummy_conf, reset}, State) ->
+  ?DBG("[EH] dummy_conf reset: clearing PC manager cache~n", []),
+  portchannel_mgr:reset_cache (),
+  {ok, State#state{keys = []}};
 handle_event ({dummy_conf, {Key, Action}}, #state{keys = Keys} = State) ->
   case portchannel_registry:classify (Key) of
     unknown -> {ok, State};
-    {ok, Class, _Vif} -> 
+    {ok, Class, _Vif} ->
       ?DBG("[EH] collected key: ~p ~p (class: ~p)~n", [Action, Key, Class#pc_class.id]),
       {ok, State#state{keys = [{Key, Action} | Keys]}}
   end;
-handle_event ({stack, {nodeup, _}}, State) ->
-  portchannel_mgr:stack_changed (),
-  {ok, State};
-handle_event ({stack, {nodedown, _}}, State) ->
-  portchannel_mgr:stack_changed (),
-  {ok, State};
 handle_event (_Event, State) ->
   {ok, State}.
 
@@ -1593,20 +1631,12 @@ code_change (_OldVsn, State, _Extra) ->
 
 
 
-
 %%%---------------------------------------------------------------------
 %%% @doc PortChannel hardware and service adapter.
 %%%
-%%%      Two things live here:
-%%%
-%%%      1. the capability table of the chip, i.e. which operations the
-%%%         packet processor accepts for a logical trunk interface, which
-%%%         of them it repeats for a port that joins later and which ones
-%%%         have to be expanded to physical ports by the manager;
-%%%
-%%%      2. the hooks for services that are driven by membership rather
-%%%         than by configuration keys (spanning tree, dhcp snooping
-%%%         bindings, errdisable state).
+%%%      Hooks for services that are driven by membership rather than
+%%%      by configuration keys (spanning tree, dhcp snooping bindings,
+%%%      errdisable state).
 %%%
 %%%      Hooks run on the master only and never touch the configuration.
 %%% @end
@@ -1621,9 +1651,7 @@ code_change (_OldVsn, State, _Extra) ->
           on_member_removed/2,
           on_pc_deleted/2]).
 
--export ([capabilities/0,
-          capability/1,
-          expansion/1]).
+-export ([expansion/1]).
 
 %%%=====================================================================
 %%% Membership hooks
@@ -1670,58 +1698,11 @@ on_pc_deleted (N, Members) ->
       ok
     end).
 
-%%%=====================================================================
-%%% Capability table
-%%%=====================================================================
-
-%% {Operation, TrunkMethod, ChipFanOut, ReplayOnJoin, ErlangExpansion,
-%%  Idempotent, Resource}
-%%
-%% TrunkMethod   — presteramgr vif_trunk_proc_init has an entry
-%% ChipFanOut    — the chip applies the operation to the current members
-%% ReplayOnJoin  — the chip repeats it for a port that joins later
-%% Idempotent    — re-applying the same value is safe (set semantics)
-%% Resource      — allocated resource that needs a compensating release
-
-capabilities () ->
-  [ {vif_mode,             true,  true,  false, none,   true,  none},
-    {vif_access_vlan,      true,  true,  false, none,   true,  none},
-    {vif_native_vlan,      true,  true,  false, none,   true,  none},
-    {vif_customer_vlan,    true,  true,  false, none,   true,  none},
-    {vif_trunk_vlans,      true,  true,  false, none,   true,  none},
-    {vif_hybrid_mode,      true,  true,  false, none,   true,  none},
-    {vif_voice_vlan,       true,  true,  false, none,   true,  none},
-    {vif_speed,            true,  true,  false, none,   true,  none},
-    {vif_duplex,           true,  true,  false, none,   true,  none},
-    {vif_flow_control,     true,  true,  false, none,   true,  none},
-    {vif_shutdown,         true,  true,  false, member, true,  none},
-    {vif_block,            true,  true,  false, none,   true,  none},
-    {vif_community,        true,  true,  false, none,   true,  none},
-    {vif_protected,        true,  true,  false, none,   true,  none},
-    {vif_pve_dst,          true,  true,  false, none,   true,  none},
-    {vif_vlan_translate,   true,  true,  false, none,   true,  none},
-    {vif_dot1q_tunnel,     true,  true,  false, none,   true,  none},
-    {vif_dgasp,            true,  true,  false, none,   true,  none},
-    {vif_stp_state,        true,  true,  false, none,   true,  none},
-    {vif_mcg,              true,  true,  true,  none,   true,  vidx},
-    {trunk_members,        false, false, false, none,   true,  trunk},
-    {port_traffic_shape,   false, false, false, member, true,  shaper},
-    {port_user_acl,        false, false, false, shared, true,  pcl},
-    {port_qos_policy,      false, false, false, shared, false, policer},
-    {port_pbr,             false, false, false, shared, true,  pcl},
-    {mon_session_src,      false, false, false, shared, true,  session}
-  ].
-
-capability (Op) ->
-  lists:keyfind (Op, 1, capabilities ()).
-
-%% Where a class has to be expanded: the chip does it, the manager does
-%% it through member copies, or a service does it by itself.
-expansion (chip)     -> chip;
-expansion (member)   -> member_copies;
-expansion (shared)   -> service;
-expansion (logical)  -> service;
-expansion (software) -> none;
+%% @doc How a mode reaches the hardware/services:
+%%      hardware — configured directly on the chip and/or service;
+%%      software — expanded by the planner onto member interfaces.
+expansion (hardware) -> hardware;
+expansion (software) -> member_copies;
 expansion (none)     -> none.
 
 %%%=====================================================================
@@ -1747,8 +1728,6 @@ call (Mod, Fun, Args) ->
 
 multicall (Mod, Fun, Args) ->
   catch node:multicall (Mod, Fun, Args).
-
-
 
 
 
@@ -2029,6 +2008,8 @@ check_member_key (#co{key = Key} = Opt, _Class, If, Ctx) ->
   end.
 
 %% Port type, group capacity and settings that forbid joining.
+%% Note: If = {Type, Unit, Port}; ports from different stack units are
+%% allowed in the same PortChannel as long as their port Type matches.
 check_join (If, Ctx) ->
   case pc_of (If, Ctx) of
     none ->
@@ -2132,17 +2113,26 @@ copy_to_member (Class, PcKey, Value, If, Ctx) ->
       Ctx;
     {ok, PortKey} ->
       Current = after_lookup (PortKey, Ctx),
+      Dup = portchannel_registry:show_run_dup (Class),
       case portchannel_registry:join_action (Class) of
         detach_and_touch ->
           Ctx1 = case Current of
                    none -> Ctx;
                    _    -> emit (Ctx, unset, PortKey, undefined, true)
                  end,
-          emit (Ctx1, set, PortKey, Value, false);
+          case Dup of
+            true  -> emit (Ctx1, set, PortKey, Value, false);
+            false -> Ctx1
+          end;
         copy_only ->
-          case Current of
-            {ok, Value} -> Ctx;
-            _           -> emit (Ctx, set, PortKey, Value, false)
+          case Dup of
+            false ->
+              Ctx;
+            true ->
+              case Current of
+                {ok, Value} -> Ctx;
+                _           -> emit (Ctx, set, PortKey, Value, false)
+              end
           end;
         replay_copy ->
           case Current of
@@ -2152,30 +2142,57 @@ copy_to_member (Class, PcKey, Value, If, Ctx) ->
       end
   end.
 
-%% Q2: a port that leaves keeps the settings; classes whose member copy
-%% was not applied on its own are materialised now.
-leave_closure (If, _N, Ctx0) ->
+%% Q2: a port that leaves keeps the settings; hardware classes whose
+%% member copy was not applied on its own are materialised now (both from
+%% mirrored member keys and from PC keys when show_run_dup is false).
+leave_closure (If, N, Ctx0) ->
+  PC = {portchannel, N},
+  Ctx1 =
+    lists:foldl (
+      fun ({PortKey, Value}, Acc) ->
+        case portchannel_registry:classify (PortKey) of
+          {ok, Class, _} ->
+            case portchannel_registry:inherited (Class) andalso
+                 portchannel_registry:leave_action (Class) == keep_materialize of
+              true  -> emit (Acc, set, PortKey, Value, true);
+              false -> Acc
+            end;
+          unknown ->
+            Acc
+        end
+      end,
+      Ctx0,
+      vif_keys (If, Ctx0)),
   lists:foldl (
-    fun ({PortKey, Value}, Acc) ->
-      case portchannel_registry:classify (PortKey) of
+    fun ({PcKey, Value}, Acc) ->
+      case portchannel_registry:classify (PcKey) of
         {ok, Class, _} ->
           case portchannel_registry:inherited (Class) andalso
+               not portchannel_registry:show_run_dup (Class) andalso
                portchannel_registry:leave_action (Class) == keep_materialize of
-            true  -> emit (Acc, set, PortKey, Value, true);
-            false -> Acc
+            true ->
+              case portchannel_registry:port_key (PcKey, If) of
+                {ok, PortKey} -> emit (Acc, set, PortKey, Value, true);
+                unknown       -> Acc
+              end;
+            false ->
+              Acc
           end;
         unknown ->
           Acc
       end
     end,
-    Ctx0,
-    vif_keys (If, Ctx0)).
+    Ctx1,
+    vif_keys (PC, Ctx1)).
 
-%% A setting written on the group is mirrored to the current members.
+%% A setting written on the group is mirrored to the current members
+%% (applied on members in software mode, or stored for show run in
+%% hardware mode when show_run_dup is enabled).
 setting_closure (#co{key = Key} = Opt, Ctx) ->
   case portchannel_registry:classify (Key) of
     {ok, Class, {portchannel, N}} ->
-      case portchannel_registry:inherited (Class) of
+      case portchannel_registry:inherited (Class) andalso
+           portchannel_registry:show_run_dup (Class) of
         true  -> fan_out (Class, Opt, N, Ctx);
         false -> Ctx
       end;
@@ -2336,8 +2353,9 @@ relevant_opt (#co{key = Key}, Ctx) ->
       false
   end.
 
-%% The apply flag of a PortChannel key depends on how the class reaches
-%% the hardware: shadow classes are stored, not executed.
+%% The apply flag of a PortChannel key depends on the class mode and flags:
+%% software-mode classes and empty-PC shadow classes are stored in config
+%% without calling the PC configurator directly.
 rewrite_apply (Opts, Ctx) ->
   [ rewrite_opt (Opt, Ctx) || Opt <- Opts ].
 
@@ -2420,16 +2438,25 @@ all_after (#ctx{validated = Tab, overlay = Overlay}) ->
 
 
 
-
-
-
 %%%---------------------------------------------------------------------
 %%% @doc PortChannel settings registry.
 %%%
 %%%      Declarative description of every configuration class the
-%%%      PortChannel manager has to reason about: how the VIF is embedded
-%%%      into the key, whether the setting is inherited by members, how it
-%%%      reaches the hardware and what has to happen on membership change.
+%%%      PortChannel manager has to reason about:
+%%%      - two execution modes:
+%%%        * `hardware` — commands that configure the PC directly on the
+%%%          chip and/or service;
+%%%        * `software` — commands that expand the PC into regular member
+%%%          interfaces and apply settings to each member separately;
+%%%      - class flags for copying/inheriting settings (`copy_settings`),
+%%%        duplicating output in `show run` (`show_run_dup`), replaying on
+%%%        member join (`replay_on_join`), detaching per-port shared
+%%%        resources (`detach_on_join`), and refreshing when membership
+%%%        changes (`reapply_on_membership`).
+%%%
+%%%      Classification is performed by `class/1` (which maps a key or
+%%%      class identifier to its `#pc_class{}` definition; in the future
+%%%      this can be tied to the `subsystem` metadata from `config_defaults`).
 %%%
 %%%      Pure module: no processes, no ETS, no side effects.
 %%% @end
@@ -2445,12 +2472,15 @@ all_after (#ctx{validated = Tab, overlay = Overlay}) ->
 
 -export ([classify/1,
           class/1,
+          class_id/1,
+          mode/1,
           vif_of/1,
           rekey/2,
           pc_key/2,
           port_key/2,
           applicable/1,
           inherited/1,
+          show_run_dup/1,
           scope_of/1,
           pc_apply/2,
           copy_apply/1,
@@ -2475,12 +2505,11 @@ all_after (#ctx{validated = Tab, overlay = Overlay}) ->
         {ok, #pc_class{}, Vif :: term ()} | unknown.
 
 classify (Key) ->
-  case describe (Key) of
+  case class (Key) of
     unknown ->
       unknown;
-    ClassId ->
-      Class = class (ClassId),
-      case vif_at (Class#pc_class.ref, Key) of
+    #pc_class{ref = Ref} = Class ->
+      case vif_at (Ref, Key) of
         {ok, Vif} ->
           case is_vif (Vif) of
             true  -> {ok, Class, Vif};
@@ -2489,6 +2518,31 @@ classify (Key) ->
         error ->
           unknown
       end
+  end.
+
+%% @doc Classifier function: determines which module/class a command key
+%%      belongs to and returns its `#pc_class{}` definition (also accepts
+%%      a class ID atom directly).
+-spec class (KeyOrId :: term ()) -> #pc_class{} | unknown.
+
+class (ClassId) when is_atom (ClassId) ->
+  class_def (ClassId);
+class (Key) ->
+  case class_id (Key) of
+    unknown -> unknown;
+    ClassId -> class_def (ClassId)
+  end.
+
+%% @doc Determine the execution mode (`hardware` | `software` | `none`)
+%%      for a `#pc_class{}`, class ID atom, or configuration key.
+-spec mode (#pc_class{} | term ()) -> hardware | software | none | unknown.
+
+mode (#pc_class{mode = Mode}) ->
+  Mode;
+mode (KeyOrId) ->
+  case class (KeyOrId) of
+    #pc_class{mode = Mode} -> Mode;
+    unknown                -> unknown
   end.
 
 %% @doc Extract the VIF a key belongs to.
@@ -2504,12 +2558,11 @@ vif_of (Key) ->
 -spec rekey (Key :: term (), Vif :: term ()) -> {ok, term ()} | unknown.
 
 rekey (Key, Vif) ->
-  case describe (Key) of
+  case class (Key) of
     unknown ->
       unknown;
-    ClassId ->
-      Class = class (ClassId),
-      set_vif (Class#pc_class.ref, Key, Vif)
+    #pc_class{ref = Ref} ->
+      set_vif (Ref, Key, Vif)
   end.
 
 -spec pc_key (Key :: term (), N :: pos_integer ()) -> {ok, term ()} | unknown.
@@ -2526,58 +2579,82 @@ port_key (Key, If) ->
 
 applicable (#pc_class{applicable = A}) -> A.
 
+%% @doc Whether settings of this class are copied/inherited by member ports.
 -spec inherited (#pc_class{}) -> boolean ().
 
-inherited (#pc_class{inherit = copy, scope = interface}) -> true;
-inherited (_)                                            -> false.
+inherited (#pc_class{scope = interface, copy_settings = true}) -> true;
+inherited (_)                                                  -> false.
+
+%% @doc Whether member copies of this class are stored in dummy_conf so
+%%      that `show running-config` duplicates the output on member ports.
+%%      In `software` mode member keys are always stored because settings
+%%      are expanded and applied to member interfaces through dummy_conf.
+-spec show_run_dup (#pc_class{}) -> boolean ().
+
+show_run_dup (#pc_class{scope = interface, copy_settings = true,
+                        mode = software}) ->
+  true;
+show_run_dup (#pc_class{scope = interface, copy_settings = true,
+                        show_run_dup = Dup}) ->
+  Dup;
+show_run_dup (_) ->
+  false.
 
 -spec scope_of (#pc_class{}) -> atom ().
 
 scope_of (#pc_class{scope = S}) -> S.
 
 %% @doc Should the PC key itself be handed to its configurator?
-%%      Members :: current (pending) member list of the PC.
+%%      - `hardware` mode: yes (unless `apply_on_empty = false` and the
+%%        group currently has no members);
+%%      - `software` mode: no (the setting is expanded onto member
+%%        interfaces and applied there separately).
 -spec pc_apply (#pc_class{}, Members :: [term ()]) -> boolean ().
 
-pc_apply (#pc_class{realization = member}, _Members)  -> false;
-pc_apply (#pc_class{realization = none}, _Members)    -> false;
-pc_apply (#pc_class{realization = shared, empty_pc = shadow}, []) -> false;
-pc_apply (_Class, _Members)                           -> true.
+pc_apply (#pc_class{mode = hardware, apply_on_empty = false}, []) -> false;
+pc_apply (#pc_class{mode = hardware}, _Members)                   -> true;
+pc_apply (#pc_class{mode = software}, _Members)                   -> false;
+pc_apply (#pc_class{mode = none}, _Members)                       -> false.
 
 %% @doc Should a member copy be handed to its configurator in steady state?
+%%      - `software` mode: yes (each member interface is configured separately);
+%%      - `hardware` mode: no (the PC itself is configured on chip/service).
 -spec copy_apply (#pc_class{}) -> boolean ().
 
-copy_apply (#pc_class{realization = member})   -> true;
-copy_apply (#pc_class{realization = software}) -> true;
-copy_apply (_)                                 -> false.
+copy_apply (#pc_class{mode = software}) -> true;
+copy_apply (#pc_class{mode = hardware}) -> false;
+copy_apply (#pc_class{mode = none})     -> false.
 
 %% @doc What has to happen with a member copy when the port joins.
 -spec join_action (#pc_class{}) -> replay_copy | copy_only | detach_and_touch.
 
-join_action (#pc_class{realization = shared})   -> detach_and_touch;
-join_action (#pc_class{realization = logical})  -> copy_only;
-join_action (_)                                 -> replay_copy.
+join_action (#pc_class{mode = software})                          -> replay_copy;
+join_action (#pc_class{mode = hardware, detach_on_join = true})   -> detach_and_touch;
+join_action (#pc_class{mode = hardware, replay_on_join = true})   -> replay_copy;
+join_action (#pc_class{mode = hardware})                          -> copy_only;
+join_action (#pc_class{mode = none})                              -> copy_only.
 
 %% @doc What has to happen when the port leaves (settings are kept, Q2).
 -spec leave_action (#pc_class{}) -> keep | keep_materialize.
 
-leave_action (#pc_class{realization = member})   -> keep;
-leave_action (#pc_class{realization = software}) -> keep;
-leave_action (_)                                 -> keep_materialize.
+leave_action (#pc_class{mode = software})                        -> keep;
+leave_action (#pc_class{mode = hardware, copy_settings = true})  -> keep_materialize;
+leave_action (_)                                                 -> keep.
 
 %% @doc What has to happen when the whole PC is deleted (Q1: reset to default).
 -spec delete_action (#pc_class{}) -> strip_copies_and_unset | unset.
 
-delete_action (#pc_class{scope = interface, inherit = copy}) -> strip_copies_and_unset;
-delete_action (_)                                            -> unset.
+delete_action (#pc_class{scope = interface, copy_settings = true}) ->
+  strip_copies_and_unset;
+delete_action (_) ->
+  unset.
 
 %% @doc Classes whose hardware expansion has to be recomputed when the
 %%      member list changes.
 -spec touch_on_members_changed (#pc_class{}) -> boolean ().
 
-touch_on_members_changed (#pc_class{scope = global})        -> true;
-touch_on_members_changed (#pc_class{realization = shared})  -> true;
-touch_on_members_changed (_)                                -> false.
+touch_on_members_changed (#pc_class{reapply_on_membership = Reapply}) ->
+  Reapply.
 
 -spec max_members () -> pos_integer ().
 
@@ -2617,34 +2694,34 @@ untag_vif ({portchannel, _} = PC) -> PC;
 untag_vif (Other)                 -> Other.
 
 %%%=====================================================================
-%%% Key shape -> class
+%%% Key shape -> class ID
 %%%=====================================================================
 
-describe ({switchport, _Vif, What})                          -> switchport_class (What);
-describe ({network, {port, _}, location})                    -> description;
-describe ({dying_gasp, {port, _}, oam})                      -> dgasp_oam;
-describe ({arp_inspection, _, trusted})                      -> arp_trust;
-describe ({snp, {port, _}, trusted})                         -> snp_trust;
-describe ({logging, _, link})                                -> logging_link;
-describe ({stp, {port, _}, _})                               -> stp_port;
-describe ({mstp_conf, {{inst, _}, {port, _}}, _})            -> mst_inst_port;
-describe ({mstp_conf, {port, _}, _})                         -> mst_port;
-describe ({pvrst_conf, {port, _}, _})                        -> pvrst_port;
-describe ({igmp, snooping, {{vlan, _}, {port, _}, mrouter}}) -> igmp_mrouter;
-describe ({igmp, snooping, {{vlan, _}, {port, _}, {ip, _}}}) -> igmp_static;
-describe ({igmp, _Vif, _})                                   -> igmp_if;
-describe ({mld, _Vif, _})                                    -> mld_if;
-describe ({ip_source_guard, _, _})                           -> ipsg;
-describe ({{pppoe, agent}, _})                               -> pppoe_ia;
-describe ({acl, 'service-acl', {_, _}})                      -> acl_service;
-describe ({service_policy, _})                               -> qos_policy;
-describe ({service_pbr, _})                                  -> pbr;
-describe ({'flex-link', _})                                  -> flex_link;
-describe ({monitor, {session, _}, {source, {port, _}}})      -> monitor_source;
-describe ({mclag, {member, _}})                              -> mclag_member;
-describe ({lacp, {port, _}, channel_group})                  -> membership;
-describe ({portchannel, {portchannel, _}, created})          -> entity;
-describe (_)                                                 -> unknown.
+class_id ({switchport, _Vif, What})                          -> switchport_class (What);
+class_id ({network, {port, _}, location})                    -> description;
+class_id ({dying_gasp, {port, _}, oam})                      -> dgasp_oam;
+class_id ({arp_inspection, _, trusted})                      -> arp_trust;
+class_id ({snp, {port, _}, trusted})                         -> snp_trust;
+class_id ({logging, _, link})                                -> logging_link;
+class_id ({stp, {port, _}, _})                               -> stp_port;
+class_id ({mstp_conf, {{inst, _}, {port, _}}, _})            -> mst_inst_port;
+class_id ({mstp_conf, {port, _}, _})                         -> mst_port;
+class_id ({pvrst_conf, {port, _}, _})                        -> pvrst_port;
+class_id ({igmp, snooping, {{vlan, _}, {port, _}, mrouter}}) -> igmp_mrouter;
+class_id ({igmp, snooping, {{vlan, _}, {port, _}, {ip, _}}}) -> igmp_static;
+class_id ({igmp, _Vif, _})                                   -> igmp_if;
+class_id ({mld, _Vif, _})                                    -> mld_if;
+class_id ({ip_source_guard, _, _})                           -> ipsg;
+class_id ({{pppoe, agent}, _})                               -> pppoe_ia;
+class_id ({acl, 'service-acl', {_, _}})                      -> acl_service;
+class_id ({service_policy, _})                               -> qos_policy;
+class_id ({service_pbr, _})                                  -> pbr;
+class_id ({'flex-link', _})                                  -> flex_link;
+class_id ({monitor, {session, _}, {source, {port, _}}})      -> monitor_source;
+class_id ({mclag, {member, _}})                              -> mclag_member;
+class_id ({lacp, {port, _}, channel_group})                  -> membership;
+class_id ({portchannel, {portchannel, _}, created})          -> entity;
+class_id (_)                                                 -> unknown.
 
 switchport_class (traffic_shape)                -> traffic_shape;
 switchport_class ({traffic_shape, _})           -> traffic_shape;
@@ -2666,121 +2743,149 @@ switchport_class ({qcn, _})                     -> port_only;
 switchport_class ({qos_trust, _})               -> port_only;
 switchport_class ({ip, address})                -> port_only;
 switchport_class ({ip, address_secondary, _})   -> port_only;
-switchport_class (mode)                         ->  switchport_mode_member;
-switchport_class ({mode, _Mode})                ->  switchport_mode_member;
+switchport_class (mode)                         -> switchport_mode_member;
+switchport_class ({mode, _Mode})                -> switchport_mode_member;
 switchport_class (_)                            -> port_l2.
 
 %%%=====================================================================
-%%% Class table
+%%% Class definitions (mode = hardware | software | none + flags)
 %%%=====================================================================
 
-%% Interface scope, inherited by members.
-class (port_l2) ->
-  #pc_class{id = port_l2, ref = {raw, 2}, realization = chip};
-class (traffic_shape) ->
-  #pc_class{id = traffic_shape, ref = {raw, 2}, realization = member,
-            empty_pc = shadow};
-class (dgasp_oam) ->
-  #pc_class{id = dgasp_oam, ref = {wrapped, 2}, realization = chip};
-class (arp_trust) ->
-  #pc_class{id = arp_trust, ref = {raw, 2}, realization = logical,
+%% Hardware mode: commands that configure the PC on the chip and/or service.
+class_def (port_l2) ->
+  #pc_class{id = port_l2, ref = {raw, 2}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
+            replay_on_join = true};
+class_def (dgasp_oam) ->
+  #pc_class{id = dgasp_oam, ref = {wrapped, 2}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
+            replay_on_join = true};
+class_def (igmp_if) ->
+  #pc_class{id = igmp_if, ref = {raw, 2}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
+            replay_on_join = true, status = to_verify};
+class_def (mld_if) ->
+  #pc_class{id = mld_if, ref = {raw, 2}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
+            replay_on_join = true, status = to_verify};
+class_def (arp_trust) ->
+  #pc_class{id = arp_trust, ref = {raw, 2}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
             status = to_verify};
-class (logging_link) ->
-  #pc_class{id = logging_link, ref = {raw, 2}, realization = software};
-class (stp_port) ->
-  #pc_class{id = stp_port, ref = {wrapped, 2}, realization = logical,
+class_def (stp_port) ->
+  #pc_class{id = stp_port, ref = {wrapped, 2}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
             status = to_verify};
-class (mst_port) ->
-  #pc_class{id = mst_port, ref = {wrapped, 2}, realization = logical,
+class_def (mst_port) ->
+  #pc_class{id = mst_port, ref = {wrapped, 2}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
             status = to_verify};
-class (mst_inst_port) ->
-  #pc_class{id = mst_inst_port, ref = {mst_inst, 2}, realization = logical,
+class_def (mst_inst_port) ->
+  #pc_class{id = mst_inst_port, ref = {mst_inst, 2}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
             status = to_verify};
-class (pvrst_port) ->
-  #pc_class{id = pvrst_port, ref = {wrapped, 2}, realization = logical,
+class_def (pvrst_port) ->
+  #pc_class{id = pvrst_port, ref = {wrapped, 2}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
             status = to_verify};
-class (igmp_if) ->
-  #pc_class{id = igmp_if, ref = {raw, 2}, realization = chip,
+class_def (ipsg) ->
+  #pc_class{id = ipsg, ref = {tagged, 2}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
             status = to_verify};
-class (mld_if) ->
-  #pc_class{id = mld_if, ref = {raw, 2}, realization = chip,
+class_def (pppoe_ia) ->
+  #pc_class{id = pppoe_ia, ref = {raw, 2}, mode = hardware,
+            copy_settings = false, show_run_dup = false,
             status = to_verify};
-class (ipsg) ->
-  #pc_class{id = ipsg, ref = {tagged, 2}, realization = logical,
-            status = to_verify};
-%% Only the base key has a shape we can rebuild for another VIF; the sub
-%% keys are nested, so the class stays uninherited and behaves as before.
-class (pppoe_ia) ->
-  #pc_class{id = pppoe_ia, ref = {raw, 2}, inherit = none,
-            realization = logical, status = to_verify};
-class (acl_service) ->
-  #pc_class{id = acl_service, ref = {acl, 3}, realization = shared,
-            empty_pc = shadow};
-class (qos_policy) ->
-  #pc_class{id = qos_policy, ref = {tagged, 2}, realization = shared,
-            empty_pc = shadow};
-class (pbr) ->
-  #pc_class{id = pbr, ref = {tagged, 2}, realization = shared,
-            empty_pc = shadow};
+class_def (acl_service) ->
+  #pc_class{id = acl_service, ref = {acl, 3}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
+            detach_on_join = true, reapply_on_membership = true,
+            apply_on_empty = false};
+class_def (qos_policy) ->
+  #pc_class{id = qos_policy, ref = {tagged, 2}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
+            detach_on_join = true, reapply_on_membership = true,
+            apply_on_empty = false};
+class_def (pbr) ->
+  #pc_class{id = pbr, ref = {tagged, 2}, mode = hardware,
+            copy_settings = true, show_run_dup = true,
+            detach_on_join = true, reapply_on_membership = true,
+            apply_on_empty = false};
+class_def (description) ->
+  #pc_class{id = description, ref = {wrapped, 2}, mode = hardware,
+            copy_settings = false, show_run_dup = false};
+class_def (flex_link) ->
+  #pc_class{id = flex_link, ref = {raw, 2}, mode = hardware,
+            copy_settings = false, show_run_dup = false};
 
-%% Interface scope, not inherited.
-class (description) ->
-  #pc_class{id = description, ref = {wrapped, 2}, inherit = none,
-            realization = software};
-class (flex_link) ->
-  #pc_class{id = flex_link, ref = {raw, 2}, inherit = none,
-            realization = logical};
+%% Software mode: commands that expand the PC into regular member
+%% interfaces and apply settings separately to each member.
+class_def (traffic_shape) ->
+  #pc_class{id = traffic_shape, ref = {raw, 2}, mode = software,
+            copy_settings = true, show_run_dup = true,
+            apply_on_empty = false};
+class_def (switchport_mode_member) ->
+  #pc_class{id = switchport_mode_member, scope = interface, ref = {raw, 2},
+            mode = software, copy_settings = true, show_run_dup = true,
+            apply_on_empty = false};
+class_def (logging_link) ->
+  #pc_class{id = logging_link, ref = {raw, 2}, mode = software,
+            copy_settings = true, show_run_dup = true};
 
 %% Denied on a PortChannel: the CLI rejects them, the planner rejects the
 %% key should it ever appear.
-class (voice_vlan) ->
-  #pc_class{id = voice_vlan, ref = {raw, 2}, inherit = none,
-            realization = none, applicable = {deny, portchannel_denied}};
-class (storm_control) ->
-  #pc_class{id = storm_control, ref = {raw, 2}, inherit = none,
-            realization = none, applicable = {deny, portchannel_denied}};
-class (rate_limit) ->
-  #pc_class{id = rate_limit, ref = {raw, 2}, inherit = none,
-            realization = none,
+class_def (voice_vlan) ->
+  #pc_class{id = voice_vlan, ref = {raw, 2}, mode = none,
+            copy_settings = false, show_run_dup = false,
+            applicable = {deny, portchannel_denied}};
+class_def (storm_control) ->
+  #pc_class{id = storm_control, ref = {raw, 2}, mode = none,
+            copy_settings = false, show_run_dup = false,
+            applicable = {deny, portchannel_denied}};
+class_def (rate_limit) ->
+  #pc_class{id = rate_limit, ref = {raw, 2}, mode = none,
+            copy_settings = false, show_run_dup = false,
             applicable = {deny, portchannel_is_not_supported}};
-class (alarm_link) ->
-  #pc_class{id = alarm_link, ref = {raw, 2}, inherit = none,
-            realization = none,
+class_def (alarm_link) ->
+  #pc_class{id = alarm_link, ref = {raw, 2}, mode = none,
+            copy_settings = false, show_run_dup = false,
             applicable = {deny, portchannel_is_not_supported}};
-class (snp_trust) ->
-  #pc_class{id = snp_trust, ref = {wrapped, 2}, inherit = none,
-            realization = none,
+class_def (snp_trust) ->
+  #pc_class{id = snp_trust, ref = {wrapped, 2}, mode = none,
+            copy_settings = false, show_run_dup = false,
             applicable = {deny, portchannel_temporarily_is_not_supported}};
-class (port_only) ->
-  #pc_class{id = port_only, ref = {raw, 2}, inherit = none,
-            realization = none,
+class_def (port_only) ->
+  #pc_class{id = port_only, ref = {raw, 2}, mode = none,
+            copy_settings = false, show_run_dup = false,
             applicable = {deny, portchannel_is_not_supported}};
 
 %% Global scope: the PC is an argument, never duplicated onto members.
-class (monitor_source) ->
+class_def (monitor_source) ->
   #pc_class{id = monitor_source, scope = global, ref = {monitor_src, 3},
-            inherit = none, realization = shared};
-class (igmp_mrouter) ->
+            mode = hardware, copy_settings = false, show_run_dup = false,
+            reapply_on_membership = true};
+class_def (igmp_mrouter) ->
   #pc_class{id = igmp_mrouter, scope = global, ref = {igmp_snoop, 3},
-            inherit = none, realization = logical, status = to_verify};
-class (igmp_static) ->
+            mode = hardware, copy_settings = false, show_run_dup = false,
+            reapply_on_membership = true, status = to_verify};
+class_def (igmp_static) ->
   #pc_class{id = igmp_static, scope = global, ref = {igmp_snoop, 3},
-            inherit = none, realization = logical, status = to_verify};
-class (mclag_member) ->
+            mode = hardware, copy_settings = false, show_run_dup = false,
+            reapply_on_membership = true, status = to_verify};
+class_def (mclag_member) ->
   #pc_class{id = mclag_member, scope = global, ref = {mclag_member, 2},
-            inherit = none, realization = logical, status = to_verify};
-
-class(switchport_mode_member) ->
-  #pc_class{id = switchport_mode_member, scope = interface, ref = {raw, 2},
-                 realization = member, empty_pc = shadow};
+            mode = hardware, copy_settings = false, show_run_dup = false,
+            reapply_on_membership = true, status = to_verify};
 
 %% Structural keys.
-class (membership) ->
+class_def (membership) ->
   #pc_class{id = membership, scope = membership, ref = {wrapped, 2},
-            inherit = none, realization = none};
-class (entity) ->
+            mode = none, copy_settings = false, show_run_dup = false};
+class_def (entity) ->
   #pc_class{id = entity, scope = entity, ref = {raw, 2},
-            inherit = none, realization = none}.
+            mode = none, copy_settings = false, show_run_dup = false};
+class_def (_) ->
+  unknown.
 
 %%%=====================================================================
 %%% VIF extraction / substitution
